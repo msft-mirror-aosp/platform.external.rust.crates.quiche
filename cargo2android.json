@@ -5,8 +5,14 @@
     ],
     "min_sdk_version": "29",
     "dependencies": true,
+    "test-data": [
+        "src/lib.rs=examples/cert.crt",
+        "src/lib.rs=examples/cert.key",
+        "src/lib.rs=examples/cert-big.crt",
+        "src/lib.rs=examples/rootca.crt"
+    ],
     "tests": true,
     "device": true,
     "run": true,
     "patch": "patches/Android.bp.patch"
-  }
+}
