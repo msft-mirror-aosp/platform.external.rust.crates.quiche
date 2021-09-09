@@ -5800,7 +5800,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Android: failure reason unkown."]
     fn unknown_version() {
         let mut config = Config::new(0xbabababa).unwrap();
         config
