@@ -5800,7 +5800,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Android: failure reason unkown."]
     fn unknown_version() {
         let mut config = Config::new(0xbabababa).unwrap();
         config
@@ -6301,7 +6300,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config
-            .set_application_protos(b"\x06proto1\06proto2")
+            .set_application_protos(b"\x06proto1\x06proto2")
             .unwrap();
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
@@ -8347,7 +8346,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config
-            .set_application_protos(b"\x06proto1\06proto2")
+            .set_application_protos(b"\x06proto1\x06proto2")
             .unwrap();
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
@@ -8407,7 +8406,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config
-            .set_application_protos(b"\x06proto1\06proto2")
+            .set_application_protos(b"\x06proto1\x06proto2")
             .unwrap();
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
@@ -8465,7 +8464,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config
-            .set_application_protos(b"\x06proto1\06proto2")
+            .set_application_protos(b"\x06proto1\x06proto2")
             .unwrap();
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
@@ -9509,7 +9508,7 @@ mod tests {
             .load_priv_key_from_pem_file("examples/cert.key")
             .unwrap();
         config
-            .set_application_protos(b"\x06proto1\06proto2")
+            .set_application_protos(b"\x06proto1\x06proto2")
             .unwrap();
 
         let mut pipe = testing::Pipe::with_server_config(&mut config).unwrap();
