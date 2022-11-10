@@ -32,12 +32,11 @@ quiche can be [integrated into curl][curl-http3] to provide support for HTTP/3.
 
 ### NGINX (unofficial)
 
-quiche can be [integrated into NGINX][nginx-http3] using an unofficial patch to
+quiche can be [integrated into NGINX](nginx/) using an unofficial patch to
 provide support for HTTP/3.
 
 [cloudflare-http3]: https://blog.cloudflare.com/http3-the-past-present-and-future/
 [curl-http3]: https://github.com/curl/curl/blob/master/docs/HTTP3.md#quiche-version
-[nginx-http3]: https://github.com/cloudflare/quiche/tree/master/extras/nginx
 
 Getting Started
 ---------------
@@ -45,20 +44,18 @@ Getting Started
 ### Command-line apps
 
 Before diving into the quiche API, here are a few examples on how to use the
-quiche tools provided as part of the [quiche-apps](tools/apps/) crate.
+quiche tools provided as part of the [quiche-apps](apps/) crate.
 
 After cloning the project according to the command mentioned in the [building](#building) section, the client can be run as follows:
 
 ```bash
- $ cargo run --manifest-path=tools/apps/Cargo.toml --bin quiche-client -- https://cloudflare-quic.com/
+ $ cargo run --bin quiche-client -- https://cloudflare-quic.com/
 ```
 
 while the server can be run as follows:
 
 ```bash
- $ cargo run --manifest-path=tools/apps/Cargo.toml --bin quiche-server -- \
-      --cert tools/apps/src/bin/cert.crt \
-      --key tools/apps/src/bin/cert.key
+ $ cargo run --bin quiche-server -- --cert apps/src/bin/cert.crt --key apps/src/bin/cert.key
 ```
 
 (note that the certificate provided is self-signed and should not be used in
@@ -97,9 +94,11 @@ incoming packets that belong to that connection from the network:
 
 ```rust
 loop {
-    let read = socket.recv(&mut buf).unwrap();
+    let (read, from) = socket.recv_from(&mut buf).unwrap();
 
-    let read = match conn.recv(&mut buf[..read]) {
+    let recv_info = quiche::RecvInfo { from };
+
+    let read = match conn.recv(&mut buf[..read], recv_info) {
         Ok(v) => v,
 
         Err(e) => {
@@ -117,7 +116,7 @@ instead:
 
 ```rust
 loop {
-    let write = match conn.send(&mut out) {
+    let (write, send_info) = match conn.send(&mut out) {
         Ok(v) => v,
 
         Err(quiche::Error::Done) => {
@@ -131,7 +130,7 @@ loop {
         },
     };
 
-    socket.send(&out[..write]).unwrap();
+    socket.send_to(&out[..write], &send_info.to).unwrap();
 }
 ```
 
@@ -154,7 +153,7 @@ conn.on_timeout();
 
 // Send more packets as needed after timeout.
 loop {
-    let write = match conn.send(&mut out) {
+    let (write, send_info) = match conn.send(&mut out) {
         Ok(v) => v,
 
         Err(quiche::Error::Done) => {
@@ -168,9 +167,28 @@ loop {
         },
     };
 
-    socket.send(&out[..write]).unwrap();
+    socket.send_to(&out[..write], &send_info.to).unwrap();
 }
 ```
+
+#### Pacing
+
+It is recommended that applications [pace] sending of outgoing packets to
+avoid creating packet bursts that could cause short-term congestion and
+losses in the network.
+
+quiche exposes pacing hints for outgoing packets through the [`at`] field
+of the [`SendInfo`] structure that is returned by the [`send()`] method.
+This field represents the time when a specific packet should be sent into
+the network.
+
+Applications can use these hints by artificially delaying the sending of
+packets through platform-specific mechanisms (such as the [`SO_TXTIME`]
+socket option on Linux), or custom methods (for example by using user-space
+timers).
+
+[pace]: https://datatracker.ietf.org/doc/html/rfc9002#section-7.7
+[`SO_TXTIME`]: https://man7.org/linux/man-pages/man8/tc-etf.8.html
 
 ### Sending and receiving stream data
 
@@ -221,11 +239,11 @@ receiving HTTP requests and responses on top of the QUIC transport protocol.
 [`stream_recv()`]: https://docs.quic.tech/quiche/struct.Connection.html#method.stream_recv
 [HTTP/3 module]: https://docs.quic.tech/quiche/h3/index.html
 
-Have a look at the [examples/] directory for more complete examples on how to use
-the quiche API, including examples on how to use quiche in C/C++ applications
-(see below for more information).
+Have a look at the [quiche/examples/] directory for more complete examples on
+how to use the quiche API, including examples on how to use quiche in C/C++
+applications (see below for more information).
 
-[examples/]: examples/
+[examples/]: quiche/examples/
 
 Calling quiche from C/C++
 -------------------------
@@ -242,12 +260,12 @@ be linked directly into C/C++ applications.
 Note that in order to enable the FFI API, the ``ffi`` feature must be enabled (it
 is disabled by default), by passing ``--features ffi`` to ``cargo``.
 
-[thin C API]: https://github.com/cloudflare/quiche/blob/master/include/quiche.h
+[thin C API]: https://github.com/cloudflare/quiche/blob/master/quiche/include/quiche.h
 
 Building
 --------
 
-quiche requires Rust 1.50 or later to build. The latest stable Rust release can
+quiche requires Rust 1.54 or later to build. The latest stable Rust release can
 be installed using [rustup](https://rustup.rs/).
 
 Once the Rust build environment is setup, the quiche source code can be fetched
@@ -288,38 +306,34 @@ the BoringSSL directory with the ``QUICHE_BSSL_PATH`` environment variable:
 
 ### Building for Android
 
-To build quiche for Android, you need the following:
+Building quiche for Android (NDK version 19 or higher, 21 recommended), can be
+done using [cargo-ndk] (v2.0 or later).
 
-- Install the [Android NDK] (13b or higher), using Android Studio or directly.
-- Set `ANDROID_NDK_HOME` environment variable to NDK path, e.g.
+First the [Android NDK] needs to be installed, either using Android Studio or
+directly, and the `ANDROID_NDK_HOME` environment variable needs to be set to the
+NDK installation path, e.g.:
 
 ```bash
  $ export ANDROID_NDK_HOME=/usr/local/share/android-ndk
 ```
 
-- Install the Rust toolchain for Android architectures needed:
+Then the Rust toolchain for the Android architectures needed can be installed as
+follows:
 
 ```bash
- $ rustup target add aarch64-linux-android arm-linux-androideabi armv7-linux-androideabi i686-linux-android x86_64-linux-android
+ $ rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 ```
 
 Note that the minimum API level is 21 for all target architectures.
 
-Depending on the NDK version used, you can take one of the following procedures:
-
-[Android NDK]: https://developer.android.com/ndk
-
-#### NDK version >= 19
-
-For NDK version 19 or higher (21 recommended), you can build in a simpler
-way using [cargo-ndk]. You need to install [cargo-ndk] (v2.0 or later) first.
+[cargo-ndk] (v2.0 or later) also needs to be installed:
 
 ```bash
  $ cargo install cargo-ndk
 ```
 
-You can build the quiche library using the following procedure. Note that
-`-t <architecture>` and `-p <NDK version>` are mandatory.
+Finally the quiche library can be built using the following procedure. Note that
+the `-t <architecture>` and `-p <NDK version>` options are mandatory.
 
 ```bash
  $ cargo ndk -t arm64-v8a -p 21 -- build --features ffi
@@ -327,38 +341,9 @@ You can build the quiche library using the following procedure. Note that
 
 See [build_android_ndk19.sh] for more information.
 
-Note that building with NDK version 18 appears to be broken.
-
+[Android NDK]: https://developer.android.com/ndk
 [cargo-ndk]: https://docs.rs/crate/cargo-ndk
 [build_android_ndk19.sh]: https://github.com/cloudflare/quiche/blob/master/tools/android/build_android_ndk19.sh
-
-#### NDK version < 18
-
-If you need to use NDK version < 18 (gcc), you can build quiche in the following way.
-
-To prepare the cross-compiling toolchain, run the following command:
-
-```bash
- $ tools/android/setup_android.sh
-```
-
-It will create a standalone toolchain for arm64/arm/x86 architectures under the
-`$TOOLCHAIN_DIR/arch` directory. If you didn't set `TOOLCHAIN_DIR` environment
-variable, the current directory will be used.
-
-After it run successfully, run the following script to build libquiche:
-
-```bash
- $ tools/android/build_android.sh --features ndk-old-gcc
-```
-
-It will build binaries for aarch64, armv7 and i686. You can pass parameters to
-this script for cargo build. For example if you want to build a release binary
-with verbose logs, do the following:
-
-```bash
- $ tools/android/build_android.sh --features ndk-old-gcc --release -vv
-```
 
 ### Building for iOS
 
