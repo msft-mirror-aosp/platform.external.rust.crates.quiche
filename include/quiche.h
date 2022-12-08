@@ -34,6 +34,16 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+#if defined(WIN32) || defined(_WIN32) || defined(__WIN32__) || defined(__NT__)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <time.h>
+#else
+#include <sys/socket.h>
+#include <sys/time.h>
+#endif
+
 #ifdef __unix__
 #include <sys/types.h>
 #endif
@@ -97,6 +107,9 @@ enum quiche_error {
     // The specified stream was stopped by the peer.
     QUICHE_ERR_STREAM_STOPPED = -15,
 
+    // The specified stream was reset by the peer.
+    QUICHE_ERR_STREAM_RESET = -16,
+
     // The received data exceeds the stream's final size.
     QUICHE_ERR_FINAL_SIZE = -13,
 
@@ -128,6 +141,10 @@ int quiche_config_load_priv_key_from_pem_file(quiche_config *config,
 // Specifies a file where trusted CA certificates are stored for the purposes of certificate verification.
 int quiche_config_load_verify_locations_from_file(quiche_config *config,
                                                   const char *path);
+
+// Specifies a directory where trusted CA certificates are stored for the purposes of certificate verification.
+int quiche_config_load_verify_locations_from_directory(quiche_config *config,
+                                                       const char *path);
 
 // Configures whether to verify the peer's certificate.
 void quiche_config_verify_peer(quiche_config *config, bool v);
@@ -198,6 +215,12 @@ void quiche_config_enable_hystart(quiche_config *config, bool v);
 void quiche_config_enable_dgram(quiche_config *config, bool enabled,
                                 size_t recv_queue_len,
                                 size_t send_queue_len);
+
+// Sets the maximum connection window.
+void quiche_config_set_max_connection_window(quiche_config *config, uint64_t v);
+
+// Sets the maximum stream window.
+void quiche_config_set_max_stream_window(quiche_config *config, uint64_t v);
 
 // Frees the config object.
 void quiche_config_free(quiche_config *config);
@@ -285,6 +308,9 @@ typedef struct {
 ssize_t quiche_conn_send(quiche_conn *conn, uint8_t *out, size_t out_len,
                          quiche_send_info *out_info);
 
+// Returns the size of the send quantum, in bytes.
+size_t quiche_conn_send_quantum(quiche_conn *conn);
+
 // Reads contiguous data from a stream.
 ssize_t quiche_conn_stream_recv(quiche_conn *conn, uint64_t stream_id,
                                 uint8_t *out, size_t buf_len, bool *fin);
@@ -350,6 +376,9 @@ void quiche_conn_destination_id(quiche_conn *conn, const uint8_t **out, size_t *
 void quiche_conn_application_proto(quiche_conn *conn, const uint8_t **out,
                                    size_t *out_len);
 
+// Returns the peer's leaf certificate (if any) as a DER-encoded buffer.
+void quiche_conn_peer_cert(quiche_conn *conn, const uint8_t **out, size_t *out_len);
+
 // Returns the serialized cryptographic session for the connection.
 void quiche_conn_session(quiche_conn *conn, const uint8_t **out, size_t *out_len);
 
@@ -377,9 +406,20 @@ uint64_t quiche_conn_peer_streams_left_uni(quiche_conn *conn);
 // Returns true if the connection is closed.
 bool quiche_conn_is_closed(quiche_conn *conn);
 
+// Returns true if the connection was closed due to the idle timeout.
+bool quiche_conn_is_timed_out(quiche_conn *conn);
+
 // Returns true if a connection error was received, and updates the provided
 // parameters accordingly.
 bool quiche_conn_peer_error(quiche_conn *conn,
+                            bool *is_app,
+                            uint64_t *error_code,
+                            const uint8_t **reason,
+                            size_t *reason_len);
+
+// Returns true if a connection error was queued or sent, and updates the provided
+// parameters accordingly.
+bool quiche_conn_local_error(quiche_conn *conn,
                             bool *is_app,
                             uint64_t *error_code,
                             const uint8_t **reason,
@@ -415,14 +455,71 @@ typedef struct {
     // The number of QUIC packets that were lost.
     size_t lost;
 
+    // The number of sent QUIC packets with retranmitted data.
+    size_t retrans;
+
     // The estimated round-trip time of the connection (in nanoseconds).
     uint64_t rtt;
 
     // The size of the connection's congestion window in bytes.
     size_t cwnd;
 
-    // The estimated data delivery rate in bytes/s.
+    // The number of sent bytes.
+    uint64_t sent_bytes;
+
+    // The number of recevied bytes.
+    uint64_t recv_bytes;
+
+    // The number of bytes lost.
+    uint64_t lost_bytes;
+
+    // The number of stream bytes retransmitted.
+    uint64_t stream_retrans_bytes;
+
+    // The current PMTU for the connection.
+    size_t pmtu;
+
+    // The most recent data delivery rate estimate in bytes/s.
     uint64_t delivery_rate;
+
+    // The maximum idle timeout.
+    uint64_t peer_max_idle_timeout;
+
+    // The maximum UDP payload size.
+    uint64_t peer_max_udp_payload_size;
+
+    // The initial flow control maximum data for the connection.
+    uint64_t peer_initial_max_data;
+
+    // The initial flow control maximum data for local bidirectional streams.
+    uint64_t peer_initial_max_stream_data_bidi_local;
+
+    // The initial flow control maximum data for remote bidirectional streams.
+    uint64_t peer_initial_max_stream_data_bidi_remote;
+
+    // The initial flow control maximum data for unidirectional streams.
+    uint64_t peer_initial_max_stream_data_uni;
+
+    // The initial maximum bidirectional streams.
+    uint64_t peer_initial_max_streams_bidi;
+
+    // The initial maximum unidirectional streams.
+    uint64_t peer_initial_max_streams_uni;
+
+    // The ACK delay exponent.
+    uint64_t peer_ack_delay_exponent;
+
+    // The max ACK delay.
+    uint64_t peer_max_ack_delay;
+
+    // Whether active migration is disabled.
+    bool peer_disable_active_migration;
+
+    // The active connection ID limit.
+    uint64_t peer_active_conn_id_limit;
+
+    // DATAGRAM frame extension parameter, if any.
+    ssize_t peer_max_datagram_frame_size;
 } quiche_stats;
 
 // Collects and returns statistics about the connection.
@@ -437,7 +534,7 @@ ssize_t quiche_conn_dgram_recv_front_len(quiche_conn *conn);
 // Returns the number of items in the DATAGRAM receive queue.
 ssize_t quiche_conn_dgram_recv_queue_len(quiche_conn *conn);
 
-///Returns the total size of all items in the DATAGRAM receive queue.
+// Returns the total size of all items in the DATAGRAM receive queue.
 ssize_t quiche_conn_dgram_recv_queue_byte_size(quiche_conn *conn);
 
 // Returns the number of items in the DATAGRAM send queue.
@@ -469,73 +566,123 @@ void quiche_conn_free(quiche_conn *conn);
 #define QUICHE_H3_APPLICATION_PROTOCOL "\x02h3\x05h3-29\x05h3-28\x05h3-27"
 
 enum quiche_h3_error {
-    /// There is no error or no work to do
+    // There is no error or no work to do
     QUICHE_H3_ERR_DONE = -1,
 
-    /// The provided buffer is too short.
+    // The provided buffer is too short.
     QUICHE_H3_ERR_BUFFER_TOO_SHORT = -2,
 
-    /// Internal error in the HTTP/3 stack.
+    // Internal error in the HTTP/3 stack.
     QUICHE_H3_ERR_INTERNAL_ERROR = -3,
 
-    /// Endpoint detected that the peer is exhibiting behavior that causes.
-    /// excessive load.
+    // Endpoint detected that the peer is exhibiting behavior that causes.
+    // excessive load.
     QUICHE_H3_ERR_EXCESSIVE_LOAD = -4,
 
-    /// Stream ID or Push ID greater that current maximum was
-    /// used incorrectly, such as exceeding a limit, reducing a limit,
-    /// or being reused.
+    // Stream ID or Push ID greater that current maximum was
+    // used incorrectly, such as exceeding a limit, reducing a limit,
+    // or being reused.
     QUICHE_H3_ERR_ID_ERROR= -5,
 
-    /// The endpoint detected that its peer created a stream that it will not
-    /// accept.
+    // The endpoint detected that its peer created a stream that it will not
+    // accept.
     QUICHE_H3_ERR_STREAM_CREATION_ERROR = -6,
 
-    /// A required critical stream was closed.
+    // A required critical stream was closed.
     QUICHE_H3_ERR_CLOSED_CRITICAL_STREAM = -7,
 
-    /// No SETTINGS frame at beginning of control stream.
+    // No SETTINGS frame at beginning of control stream.
     QUICHE_H3_ERR_MISSING_SETTINGS = -8,
 
-    /// A frame was received which is not permitted in the current state.
+    // A frame was received which is not permitted in the current state.
     QUICHE_H3_ERR_FRAME_UNEXPECTED = -9,
 
-    /// Frame violated layout or size rules.
+    // Frame violated layout or size rules.
     QUICHE_H3_ERR_FRAME_ERROR = -10,
 
-    /// QPACK Header block decompression failure.
+    // QPACK Header block decompression failure.
     QUICHE_H3_ERR_QPACK_DECOMPRESSION_FAILED = -11,
 
-    /// Error originated from the transport layer.
-    QUICHE_H3_ERR_TRANSPORT_ERROR = -12,
+    // -12 was previously used for TransportError, skip it
 
-    /// The underlying QUIC stream (or connection) doesn't have enough capacity
-    /// for the operation to complete. The application should retry later on.
+    // The underlying QUIC stream (or connection) doesn't have enough capacity
+    // for the operation to complete. The application should retry later on.
     QUICHE_H3_ERR_STREAM_BLOCKED = -13,
 
-    /// Error in the payload of a SETTINGS frame.
+    // Error in the payload of a SETTINGS frame.
     QUICHE_H3_ERR_SETTINGS_ERROR = -14,
 
-    /// Server rejected request.
+    // Server rejected request.
     QUICHE_H3_ERR_REQUEST_REJECTED = -15,
 
-    /// Request or its response cancelled.
+    // Request or its response cancelled.
     QUICHE_H3_ERR_REQUEST_CANCELLED = -16,
 
-    /// Client's request stream terminated without containing a full-formed
-    /// request.
+    // Client's request stream terminated without containing a full-formed
+    // request.
     QUICHE_H3_ERR_REQUEST_INCOMPLETE = -17,
 
-    /// An HTTP message was malformed and cannot be processed.
+    // An HTTP message was malformed and cannot be processed.
     QUICHE_H3_ERR_MESSAGE_ERROR = -18,
 
     // The TCP connection established in response to a CONNECT request was
-    /// reset or abnormally closed.
+    // reset or abnormally closed.
     QUICHE_H3_ERR_CONNECT_ERROR = -19,
 
-    /// The requested operation cannot be served over HTTP/3. Peer should retry
-    /// over HTTP/1.1.
+    // The requested operation cannot be served over HTTP/3. Peer should retry
+    // over HTTP/1.1.
     QUICHE_H3_ERR_VERSION_FALLBACK = -20,
+
+    // The following QUICHE_H3_TRANSPORT_ERR_* errors are propagated
+    // from the QUIC transport layer.
+
+    // See QUICHE_ERR_DONE.
+    QUICHE_H3_TRANSPORT_ERR_DONE = QUICHE_ERR_DONE - 1000,
+
+    // See QUICHE_ERR_BUFFER_TOO_SHORT.
+    QUICHE_H3_TRANSPORT_ERR_BUFFER_TOO_SHORT = QUICHE_ERR_BUFFER_TOO_SHORT - 1000,
+
+    // See QUICHE_ERR_UNKNOWN_VERSION.
+    QUICHE_H3_TRANSPORT_ERR_UNKNOWN_VERSION = QUICHE_ERR_UNKNOWN_VERSION - 1000,
+
+    // See QUICHE_ERR_INVALID_FRAME.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_FRAME = QUICHE_ERR_INVALID_FRAME - 1000,
+
+    // See QUICHE_ERR_INVALID_PACKET.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_PACKET = QUICHE_ERR_INVALID_PACKET - 1000,
+
+    // See QUICHE_ERR_INVALID_STATE.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_STATE = QUICHE_ERR_INVALID_STATE - 1000,
+
+    // See QUICHE_ERR_INVALID_STREAM_STATE.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_STREAM_STATE = QUICHE_ERR_INVALID_STREAM_STATE - 1000,
+
+    // See QUICHE_ERR_INVALID_TRANSPORT_PARAM.
+    QUICHE_H3_TRANSPORT_ERR_INVALID_TRANSPORT_PARAM = QUICHE_ERR_INVALID_TRANSPORT_PARAM - 1000,
+
+    // See QUICHE_ERR_CRYPTO_FAIL.
+    QUICHE_H3_TRANSPORT_ERR_CRYPTO_FAIL = QUICHE_ERR_CRYPTO_FAIL - 1000,
+
+    // See QUICHE_ERR_TLS_FAIL.
+    QUICHE_H3_TRANSPORT_ERR_TLS_FAIL = QUICHE_ERR_TLS_FAIL - 1000,
+
+    // See QUICHE_ERR_FLOW_CONTROL.
+    QUICHE_H3_TRANSPORT_ERR_FLOW_CONTROL = QUICHE_ERR_FLOW_CONTROL - 1000,
+
+    // See QUICHE_ERR_STREAM_LIMIT.
+    QUICHE_H3_TRANSPORT_ERR_STREAM_LIMIT = QUICHE_ERR_STREAM_LIMIT - 1000,
+
+    // See QUICHE_ERR_STREAM_STOPPED.
+    QUICHE_H3_TRANSPORT_ERR_STREAM_STOPPED = QUICHE_ERR_STREAM_STOPPED - 1000,
+
+    // See QUICHE_ERR_STREAM_RESET.
+    QUICHE_H3_TRANSPORT_ERR_STREAM_RESET = QUICHE_ERR_STREAM_RESET - 1000,
+
+    // See QUICHE_ERR_FINAL_SIZE.
+    QUICHE_H3_TRANSPORT_ERR_FINAL_SIZE = QUICHE_ERR_FINAL_SIZE - 1000,
+
+    // See QUICHE_ERR_CONGESTION_CONTROL.
+    QUICHE_H3_TRANSPORT_ERR_CONGESTION_CONTROL = QUICHE_ERR_CONGESTION_CONTROL - 1000,
 };
 
 // Stores configuration shared between multiple connections.
@@ -544,8 +691,8 @@ typedef struct Http3Config quiche_h3_config;
 // Creates an HTTP/3 config object with default settings values.
 quiche_h3_config *quiche_h3_config_new(void);
 
-// Sets the `SETTINGS_MAX_HEADER_LIST_SIZE` setting.
-void quiche_h3_config_set_max_header_list_size(quiche_h3_config *config, uint64_t v);
+// Sets the `SETTINGS_MAX_FIELD_SECTION_SIZE` setting.
+void quiche_h3_config_set_max_field_section_size(quiche_h3_config *config, uint64_t v);
 
 // Sets the `SETTINGS_QPACK_MAX_TABLE_CAPACITY` setting.
 void quiche_h3_config_set_qpack_max_table_capacity(quiche_h3_config *config, uint64_t v);
@@ -573,6 +720,8 @@ enum quiche_h3_event_type {
     QUICHE_H3_EVENT_FINISHED,
     QUICHE_H3_EVENT_DATAGRAM,
     QUICHE_H3_EVENT_GOAWAY,
+    QUICHE_H3_EVENT_RESET,
+    QUICHE_H3_EVENT_PRIORITY_UPDATE,
 };
 
 typedef struct Http3Event quiche_h3_event;
@@ -596,6 +745,16 @@ int quiche_h3_event_for_each_header(quiche_h3_event *ev,
                                               void *argp),
                                     void *argp);
 
+// Iterates over the peer's HTTP/3 settings.
+//
+// The `cb` callback will be called for each setting in `conn`.
+// If `cb` returns any value other than `0`, processing will be interrupted and
+// the value is returned to the caller.
+int quiche_h3_for_each_setting(quiche_h3_conn *conn,
+                               int (*cb)(uint64_t identifier,
+                                         uint64_t value, void *argp),
+                               void *argp);
+
 // Check whether data will follow the headers on the stream.
 bool quiche_h3_event_headers_has_body(quiche_h3_event *ev);
 
@@ -609,6 +768,12 @@ typedef struct {
     const uint8_t *value;
     size_t value_len;
 } quiche_h3_header;
+
+// Extensible Priorities parameters.
+typedef struct {
+    uint8_t urgency;
+    bool incremental;
+} quiche_h3_priority;
 
 // Sends an HTTP/3 request.
 int64_t quiche_h3_send_request(quiche_h3_conn *conn, quiche_conn *quic_conn,
@@ -624,7 +789,7 @@ int quiche_h3_send_response(quiche_h3_conn *conn, quiche_conn *quic_conn,
 int quiche_h3_send_response_with_priority(quiche_h3_conn *conn,
                             quiche_conn *quic_conn, uint64_t stream_id,
                             quiche_h3_header *headers, size_t headers_len,
-                            const char *priority, bool fin);
+                            quiche_h3_priority *priority, bool fin);
 
 // Sends an HTTP/3 body chunk on the given stream.
 ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
@@ -634,6 +799,23 @@ ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
 // Reads request or response body data into the provided buffer.
 ssize_t quiche_h3_recv_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
                             uint64_t stream_id, uint8_t *out, size_t out_len);
+
+// Try to parse an Extensible Priority field value.
+int quiche_h3_parse_extensible_priority(uint8_t *priority,
+                                        size_t priority_len,
+                                        quiche_h3_priority *parsed);
+
+// Take the last received PRIORITY_UPDATE frame for a stream.
+//
+// The `cb` callback will be called once. `cb` should check the validity of
+// priority field value contents. If `cb` returns any value other than `0`,
+// processing will be interrupted and the value is returned to the caller.
+int quiche_h3_take_last_priority_update(quiche_h3_conn *conn,
+                                        uint64_t prioritized_element_id,
+                                        int (*cb)(uint8_t  *priority_field_value,
+                                                  uint64_t priority_field_value_len,
+                                                  void *argp),
+                                        void *argp);
 
 // Returns whether the peer enabled HTTP/3 DATAGRAM frame support.
 bool quiche_h3_dgram_enabled_by_peer(quiche_h3_conn *conn,
