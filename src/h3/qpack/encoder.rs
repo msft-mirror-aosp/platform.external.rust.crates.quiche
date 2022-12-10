@@ -26,8 +26,6 @@
 
 use super::Result;
 
-use crate::octets;
-
 use crate::h3::NameValue;
 
 use super::INDEXED;
@@ -35,13 +33,8 @@ use super::LITERAL;
 use super::LITERAL_WITH_NAME_REF;
 
 /// A QPACK encoder.
+#[derive(Default)]
 pub struct Encoder {}
-
-impl Default for Encoder {
-    fn default() -> Encoder {
-        Encoder {}
-    }
-}
 
 impl Encoder {
     /// Creates a new QPACK encoder.
@@ -162,8 +155,6 @@ fn encode_str(v: &[u8], prefix: usize, b: &mut octets::OctetsMut) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::octets;
 
     #[test]
     fn encode_int1() {
