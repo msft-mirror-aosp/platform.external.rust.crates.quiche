@@ -1,26 +1,6 @@
 // Additional parameters for Android build of BoringSSL.
 //
-// Android NDK < 18 with GCC.
-const CMAKE_PARAMS_ANDROID_NDK_OLD_GCC: &[(&str, &[(&str, &str)])] = &[
-    ("aarch64", &[(
-        "ANDROID_TOOLCHAIN_NAME",
-        "aarch64-linux-android-4.9",
-    )]),
-    ("arm", &[(
-        "ANDROID_TOOLCHAIN_NAME",
-        "arm-linux-androideabi-4.9",
-    )]),
-    ("x86", &[(
-        "ANDROID_TOOLCHAIN_NAME",
-        "x86-linux-android-4.9",
-    )]),
-    ("x86_64", &[(
-        "ANDROID_TOOLCHAIN_NAME",
-        "x86_64-linux-android-4.9",
-    )]),
-];
-
-// Android NDK >= 19.
+// Requires Android NDK >= 19.
 const CMAKE_PARAMS_ANDROID_NDK: &[(&str, &[(&str, &str)])] = &[
     ("aarch64", &[("ANDROID_ABI", "arm64-v8a")]),
     ("arm", &[("ANDROID_ABI", "armeabi-v7a")]),
@@ -97,17 +77,11 @@ fn get_boringssl_cmake_config() -> cmake::Config {
     // Add platform-specific parameters.
     match os.as_ref() {
         "android" => {
-            let cmake_params_android = if cfg!(feature = "ndk-old-gcc") {
-                CMAKE_PARAMS_ANDROID_NDK_OLD_GCC
-            } else {
-                CMAKE_PARAMS_ANDROID_NDK
-            };
-
             // We need ANDROID_NDK_HOME to be set properly.
             let android_ndk_home = std::env::var("ANDROID_NDK_HOME")
                 .expect("Please set ANDROID_NDK_HOME for Android build");
             let android_ndk_home = std::path::Path::new(&android_ndk_home);
-            for (android_arch, params) in cmake_params_android {
+            for (android_arch, params) in CMAKE_PARAMS_ANDROID_NDK {
                 if *android_arch == arch {
                     for (name, value) in *params {
                         boringssl_cmake.define(name, value);
@@ -199,11 +173,10 @@ fn get_boringssl_cmake_config() -> cmake::Config {
 fn write_pkg_config() {
     use std::io::prelude::*;
 
-    let profile = std::env::var("PROFILE").unwrap();
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let target_dir = format!("{}/target/{}", manifest_dir, profile);
+    let target_dir = target_dir_path();
 
-    let out_path = std::path::Path::new(&target_dir).join("quiche.pc");
+    let out_path = target_dir.as_path().join("quiche.pc");
     let mut out_file = std::fs::File::create(&out_path).unwrap();
 
     let include_dir = format!("{}/include", manifest_dir);
@@ -222,14 +195,31 @@ Version: {}
 Libs: -Wl,-rpath,${{libdir}} -L${{libdir}} -lquiche
 Cflags: -I${{includedir}}
 ",
-        include_dir, target_dir, version
+        include_dir,
+        target_dir.to_str().unwrap(),
+        version
     );
 
     out_file.write_all(output.as_bytes()).unwrap();
 }
 
+fn target_dir_path() -> std::path::PathBuf {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let out_dir = std::path::Path::new(&out_dir);
+
+    for p in out_dir.ancestors() {
+        if p.ends_with("build") {
+            return p.parent().unwrap().to_path_buf();
+        }
+    }
+
+    unreachable!();
+}
+
 fn main() {
-    if cfg!(feature = "boringssl-vendored") && !cfg!(feature = "boring-sys") {
+    if cfg!(feature = "boringssl-vendored") &&
+        !cfg!(feature = "boringssl-boring-crate")
+    {
         let bssl_dir = std::env::var("QUICHE_BSSL_PATH").unwrap_or_else(|_| {
             let mut cfg = get_boringssl_cmake_config();
 
@@ -249,13 +239,14 @@ fn main() {
         println!("cargo:rustc-link-lib=static=ssl");
     }
 
-    if cfg!(feature = "boring-sys") {
+    if cfg!(feature = "boringssl-boring-crate") {
         println!("cargo:rustc-link-lib=static=crypto");
         println!("cargo:rustc-link-lib=static=ssl");
     }
 
     // MacOS: Allow cdylib to link with undefined symbols
-    if cfg!(target_os = "macos") {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    if target_os == "macos" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }
 
