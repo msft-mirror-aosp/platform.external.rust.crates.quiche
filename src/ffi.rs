@@ -76,7 +76,7 @@ use crate::*;
 
 #[no_mangle]
 pub extern fn quiche_version() -> *const u8 {
-    //static VERSION: &str = concat!("0.9.0", "\0");
+    //static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     // ANDROID's build system doesn't support environment variables
     // so we hardcode the package version here.
     static VERSION: &str = concat!("0.6.0", "\0");
@@ -159,6 +159,19 @@ pub extern fn quiche_config_load_verify_locations_from_file(
     let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
 
     match config.load_verify_locations_from_file(path) {
+        Ok(_) => 0,
+
+        Err(e) => e.to_c() as c_int,
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_config_load_verify_locations_from_directory(
+    config: &mut Config, path: *const c_char,
+) -> c_int {
+    let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
+
+    match config.load_verify_locations_from_directory(path) {
         Ok(_) => 0,
 
         Err(e) => e.to_c() as c_int,
@@ -307,6 +320,18 @@ pub extern fn quiche_config_set_max_send_udp_payload_size(
 }
 
 #[no_mangle]
+pub extern fn quiche_config_set_max_connection_window(
+    config: &mut Config, v: u64,
+) {
+    config.set_max_connection_window(v);
+}
+
+#[no_mangle]
+pub extern fn quiche_config_set_max_stream_window(config: &mut Config, v: u64) {
+    config.set_max_stream_window(v);
+}
+
+#[no_mangle]
 pub extern fn quiche_config_free(config: *mut Config) {
     unsafe { Box::from_raw(config) };
 }
@@ -395,7 +420,7 @@ pub extern fn quiche_accept(
     let from = std_addr_from_c(from, from_len);
 
     match accept(&scid, odcid.as_ref(), from, config) {
-        Ok(c) => Box::into_raw(Pin::into_inner(c)),
+        Ok(c) => Box::into_raw(Box::new(c)),
 
         Err(_) => ptr::null_mut(),
     }
@@ -418,7 +443,7 @@ pub extern fn quiche_connect(
     let to = std_addr_from_c(to, to_len);
 
     match connect(server_name, &scid, to, config) {
-        Ok(c) => Box::into_raw(Pin::into_inner(c)),
+        Ok(c) => Box::into_raw(Box::new(c)),
 
         Err(_) => ptr::null_mut(),
     }
@@ -503,7 +528,7 @@ pub extern fn quiche_conn_new_with_tls(
         tls,
         is_server,
     ) {
-        Ok(c) => Box::into_raw(Pin::into_inner(c)),
+        Ok(c) => Box::into_raw(Box::new(c)),
 
         Err(_) => ptr::null_mut(),
     }
@@ -877,6 +902,20 @@ pub extern fn quiche_conn_application_proto(
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_peer_cert(
+    conn: &mut Connection, out: &mut *const u8, out_len: &mut size_t,
+) {
+    match conn.peer_cert() {
+        Some(peer_cert) => {
+            *out = peer_cert.as_ptr();
+            *out_len = peer_cert.len();
+        },
+
+        None => *out_len = 0,
+    }
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_session(
     conn: &mut Connection, out: &mut *const u8, out_len: &mut size_t,
 ) {
@@ -911,11 +950,35 @@ pub extern fn quiche_conn_is_closed(conn: &mut Connection) -> bool {
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_is_timed_out(conn: &mut Connection) -> bool {
+    conn.is_timed_out()
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_peer_error(
     conn: &mut Connection, is_app: *mut bool, error_code: *mut u64,
     reason: &mut *const u8, reason_len: &mut size_t,
 ) -> bool {
     match &conn.peer_error {
+        Some(conn_err) => unsafe {
+            *is_app = conn_err.is_app;
+            *error_code = conn_err.error_code;
+            *reason = conn_err.reason.as_ptr();
+            *reason_len = conn_err.reason.len();
+
+            true
+        },
+
+        None => false,
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_local_error(
+    conn: &mut Connection, is_app: *mut bool, error_code: *mut u64,
+    reason: &mut *const u8, reason_len: &mut size_t,
+) -> bool {
+    match &conn.local_error {
         Some(conn_err) => unsafe {
             *is_app = conn_err.is_app;
             *error_code = conn_err.error_code;
@@ -951,9 +1014,28 @@ pub struct Stats {
     recv: usize,
     sent: usize,
     lost: usize,
+    retrans: usize,
     rtt: u64,
     cwnd: usize,
+    sent_bytes: u64,
+    lost_bytes: u64,
+    recv_bytes: u64,
+    stream_retrans_bytes: u64,
+    pmtu: usize,
     delivery_rate: u64,
+    peer_max_idle_timeout: u64,
+    peer_max_udp_payload_size: u64,
+    peer_initial_max_data: u64,
+    peer_initial_max_stream_data_bidi_local: u64,
+    peer_initial_max_stream_data_bidi_remote: u64,
+    peer_initial_max_stream_data_uni: u64,
+    peer_initial_max_streams_bidi: u64,
+    peer_initial_max_streams_uni: u64,
+    peer_ack_delay_exponent: u64,
+    peer_max_ack_delay: u64,
+    peer_disable_active_migration: bool,
+    peer_active_conn_id_limit: u64,
+    peer_max_datagram_frame_size: ssize_t,
 }
 
 #[no_mangle]
@@ -963,9 +1045,34 @@ pub extern fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
     out.recv = stats.recv;
     out.sent = stats.sent;
     out.lost = stats.lost;
+    out.retrans = stats.retrans;
     out.rtt = stats.rtt.as_nanos() as u64;
     out.cwnd = stats.cwnd;
+    out.sent_bytes = stats.sent_bytes;
+    out.lost_bytes = stats.lost_bytes;
+    out.recv_bytes = stats.recv_bytes;
+    out.stream_retrans_bytes = stats.stream_retrans_bytes;
+    out.pmtu = stats.pmtu;
     out.delivery_rate = stats.delivery_rate;
+    out.peer_max_idle_timeout = stats.peer_max_idle_timeout;
+    out.peer_max_udp_payload_size = stats.peer_max_udp_payload_size;
+    out.peer_initial_max_data = stats.peer_initial_max_data;
+    out.peer_initial_max_stream_data_bidi_local =
+        stats.peer_initial_max_stream_data_bidi_local;
+    out.peer_initial_max_stream_data_bidi_remote =
+        stats.peer_initial_max_stream_data_bidi_remote;
+    out.peer_initial_max_stream_data_uni = stats.peer_initial_max_stream_data_uni;
+    out.peer_initial_max_streams_bidi = stats.peer_initial_max_streams_bidi;
+    out.peer_initial_max_streams_uni = stats.peer_initial_max_streams_uni;
+    out.peer_ack_delay_exponent = stats.peer_ack_delay_exponent;
+    out.peer_max_ack_delay = stats.peer_max_ack_delay;
+    out.peer_disable_active_migration = stats.peer_disable_active_migration;
+    out.peer_active_conn_id_limit = stats.peer_active_conn_id_limit;
+    out.peer_max_datagram_frame_size = match stats.peer_max_datagram_frame_size {
+        None => Error::Done.to_c(),
+
+        Some(v) => v as ssize_t,
+    }
 }
 
 #[no_mangle]
@@ -1071,6 +1178,11 @@ pub extern fn quiche_conn_peer_streams_left_bidi(conn: &mut Connection) -> u64 {
 #[no_mangle]
 pub extern fn quiche_conn_peer_streams_left_uni(conn: &mut Connection) -> u64 {
     conn.peer_streams_left_uni()
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_send_quantum(conn: &mut Connection) -> size_t {
+    conn.send_quantum() as size_t
 }
 
 fn std_addr_from_c(addr: &sockaddr, addr_len: socklen_t) -> SocketAddr {

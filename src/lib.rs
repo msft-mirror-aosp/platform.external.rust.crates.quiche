@@ -196,6 +196,25 @@
 //! # Ok::<(), quiche::Error>(())
 //! ```
 //!
+//! ### Pacing
+//!
+//! It is recommended that applications [pace] sending of outgoing packets to
+//! avoid creating packet bursts that could cause short-term congestion and
+//! losses in the network.
+//!
+//! quiche exposes pacing hints for outgoing packets through the [`at`] field
+//! of the [`SendInfo`] structure that is returned by the [`send()`] method.
+//! This field represents the time when a specific packet should be sent into
+//! the network.
+//!
+//! Applications can use these hints by artificially delaying the sending of
+//! packets through platform-specific mechanisms (such as the [`SO_TXTIME`]
+//! socket option on Linux), or custom methods (for example by using user-space
+//! timers).
+//!
+//! [pace]: https://datatracker.ietf.org/doc/html/rfc9002#section-7.7
+//! [`SO_TXTIME`]: https://man7.org/linux/man-pages/man8/tc-etf.8.html
+//!
 //! ## Sending and receiving stream data
 //!
 //! After some back and forth, the connection will complete its handshake and
@@ -251,6 +270,7 @@
 //! [`RecvInfo`]: struct.RecvInfo.html
 //! [`send()`]: struct.Connection.html#method.send
 //! [`SendInfo`]: struct.SendInfo.html
+//! [`at`]: struct.SendInfo.html#structfield.at
 //! [`timeout()`]: struct.Connection.html#method.timeout
 //! [`on_timeout()`]: struct.Connection.html#method.on_timeout
 //! [`stream_send()`]: struct.Connection.html#method.stream_send
@@ -286,24 +306,60 @@
 //! or [`accept()`]. Otherwise the connection will use a default CC algorithm.
 //!
 //! [`CongestionControlAlgorithm`]: enum.CongestionControlAlgorithm.html
+//!
+//! ## Feature flags
+//!
+//! quiche defines a number of [feature flags] to reduce the amount of compiled
+//! code and dependencies:
+//!
+//! * `boringssl-vendored` (default): Build the vendored BoringSSL library.
+//!
+//! * `boringssl-boring-crate`: Use the BoringSSL library provided by the
+//!   [boring] crate. It takes precedence over `boringssl-vendored` if both
+//!   features are enabled.
+//!
+//! * `pkg-config-meta`: Generate pkg-config metadata file for libquiche.
+//!
+//! * `ffi`: Build and expose the FFI API.
+//!
+//! * `qlog`: Enable support for the [qlog] logging format.
+//!
+//! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
+//! [boring]: https://crates.io/crates/boring
+//! [qlog]: https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema
 
-#![allow(improper_ctypes)]
-#![allow(clippy::suspicious_operation_groupings)]
 #![allow(clippy::upper_case_acronyms)]
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[macro_use]
 extern crate log;
+
+#[cfg(feature = "qlog")]
+use qlog::events::connectivity::TransportOwner;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::RecoveryEventType;
+#[cfg(feature = "qlog")]
+use qlog::events::quic::TransportEventType;
+#[cfg(feature = "qlog")]
+use qlog::events::DataRecipient;
+#[cfg(feature = "qlog")]
+use qlog::events::Event;
+#[cfg(feature = "qlog")]
+use qlog::events::EventData;
+#[cfg(feature = "qlog")]
+use qlog::events::EventImportance;
+#[cfg(feature = "qlog")]
+use qlog::events::EventType;
+#[cfg(feature = "qlog")]
+use qlog::events::RawInfo;
 
 use std::cmp;
 use std::time;
 
 use std::net::SocketAddr;
 
-use std::pin::Pin;
 use std::str::FromStr;
-
-use std::sync::Mutex;
 
 use std::collections::VecDeque;
 
@@ -360,6 +416,16 @@ const PAYLOAD_LENGTH_LEN: usize = 2;
 const MAX_UNDECRYPTABLE_PACKETS: usize = 10;
 
 const RESERVED_VERSION_MASK: u32 = 0xfafafafa;
+
+// The default size of the receiver connection flow control window.
+const DEFAULT_CONNECTION_WINDOW: u64 = 48 * 1024;
+
+// The maximum size of the receiver connection flow control window.
+const MAX_CONNECTION_WINDOW: u64 = 24 * 1024 * 1024;
+
+// How much larger the connection flow control window need to be larger than
+// the stream flow control window.
+const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 
 /// A specialized [`Result`] type for quiche operations.
 ///
@@ -419,6 +485,12 @@ pub enum Error {
     /// associated data.
     StreamStopped(u64),
 
+    /// The specified stream was reset by the peer.
+    ///
+    /// The error code sent as part of the `RESET_STREAM` frame is provided as
+    /// associated data.
+    StreamReset(u64),
+
     /// The received data exceeds the stream's final size.
     FinalSize,
 
@@ -458,6 +530,7 @@ impl Error {
             Error::FinalSize => -13,
             Error::CongestionControl => -14,
             Error::StreamStopped { .. } => -15,
+            Error::StreamReset { .. } => -16,
         }
     }
 }
@@ -494,6 +567,10 @@ pub struct SendInfo {
     pub to: SocketAddr,
 
     /// The time to send the packet out.
+    ///
+    /// See [Pacing] for more details.
+    ///
+    /// [Pacing]: index.html#pacing
     pub at: time::Instant,
 }
 
@@ -524,17 +601,28 @@ pub enum Shutdown {
     Write = 1,
 }
 
+/// Qlog logging level.
+#[repr(C)]
+#[cfg(feature = "qlog")]
+#[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
+pub enum QlogLevel {
+    /// Logs any events of Core importance.
+    Core  = 0,
+
+    /// Logs any events of Core and Base importance.
+    Base  = 1,
+
+    /// Logs any events of Core, Base and Extra importance
+    Extra = 2,
+}
+
 /// Stores configuration shared between multiple connections.
 pub struct Config {
     local_transport_params: TransportParams,
 
     version: u32,
 
-    // BoringSSL's SSL_CTX structure is technically safe to share across threads
-    // but once shared, functions that modify it can't be used any more. We can't
-    // encode that in Rust, so just make it Send+Sync with a mutex to fulfill
-    // the Sync constraint.
-    tls_ctx: Mutex<tls::Context>,
+    tls_ctx: tls::Context,
 
     application_protos: Vec<Vec<u8>>,
 
@@ -548,6 +636,9 @@ pub struct Config {
     dgram_send_max_queue_len: usize,
 
     max_send_udp_payload_size: usize,
+
+    max_connection_window: u64,
+    max_stream_window: u64,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -565,11 +656,27 @@ impl Config {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn new(version: u32) -> Result<Config> {
+        Self::with_tls_ctx(version, tls::Context::new()?)
+    }
+
+    /// Creates a config object with the given version and [`SslContext`].
+    ///
+    /// This is useful for applications that wish to manually configure
+    /// [`SslContext`].
+    ///
+    /// [`SslContext`]: https://docs.rs/boring/latest/boring/ssl/struct.SslContext.html
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
+    pub fn with_boring_ssl_ctx(
+        version: u32, tls_ctx: boring::ssl::SslContext,
+    ) -> Result<Config> {
+        Self::with_tls_ctx(version, tls::Context::from_boring(tls_ctx))
+    }
+
+    fn with_tls_ctx(version: u32, tls_ctx: tls::Context) -> Result<Config> {
         if !is_reserved_version(version) && !version_is_supported(version) {
             return Err(Error::UnknownVersion);
         }
-
-        let tls_ctx = Mutex::new(tls::Context::new()?);
 
         Ok(Config {
             local_transport_params: TransportParams::default(),
@@ -584,6 +691,9 @@ impl Config {
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
 
             max_send_udp_payload_size: MAX_SEND_UDP_PAYLOAD_SIZE,
+
+            max_connection_window: MAX_CONNECTION_WINDOW,
+            max_stream_window: stream::MAX_STREAM_WINDOW,
         })
     }
 
@@ -600,10 +710,7 @@ impl Config {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn load_cert_chain_from_pem_file(&mut self, file: &str) -> Result<()> {
-        self.tls_ctx
-            .lock()
-            .unwrap()
-            .use_certificate_chain_file(file)
+        self.tls_ctx.use_certificate_chain_file(file)
     }
 
     /// Configures the given private key.
@@ -618,7 +725,7 @@ impl Config {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn load_priv_key_from_pem_file(&mut self, file: &str) -> Result<()> {
-        self.tls_ctx.lock().unwrap().use_privkey_file(file)
+        self.tls_ctx.use_privkey_file(file)
     }
 
     /// Specifies a file where trusted CA certificates are stored for the
@@ -634,10 +741,7 @@ impl Config {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn load_verify_locations_from_file(&mut self, file: &str) -> Result<()> {
-        self.tls_ctx
-            .lock()
-            .unwrap()
-            .load_verify_locations_from_file(file)
+        self.tls_ctx.load_verify_locations_from_file(file)
     }
 
     /// Specifies a directory where trusted CA certificates are stored for the
@@ -655,10 +759,7 @@ impl Config {
     pub fn load_verify_locations_from_directory(
         &mut self, dir: &str,
     ) -> Result<()> {
-        self.tls_ctx
-            .lock()
-            .unwrap()
-            .load_verify_locations_from_directory(dir)
+        self.tls_ctx.load_verify_locations_from_directory(dir)
     }
 
     /// Configures whether to verify the peer's certificate.
@@ -666,7 +767,7 @@ impl Config {
     /// The default value is `true` for client connections, and `false` for
     /// server ones.
     pub fn verify_peer(&mut self, verify: bool) {
-        self.tls_ctx.lock().unwrap().set_verify(verify);
+        self.tls_ctx.set_verify(verify);
     }
 
     /// Configures whether to send GREASE values.
@@ -685,7 +786,7 @@ impl Config {
     /// [`set_keylog()`]: struct.Connection.html#method.set_keylog
     /// [keylog]: https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format
     pub fn log_keys(&mut self) {
-        self.tls_ctx.lock().unwrap().enable_keylog();
+        self.tls_ctx.enable_keylog();
     }
 
     /// Configures the session ticket key material.
@@ -699,12 +800,12 @@ impl Config {
     /// servers), in which case the application is also responsible for
     /// rotating the key to provide forward secrecy.
     pub fn set_ticket_key(&mut self, key: &[u8]) -> Result<()> {
-        self.tls_ctx.lock().unwrap().set_ticket_key(key)
+        self.tls_ctx.set_ticket_key(key)
     }
 
     /// Enables sending or receiving early data.
     pub fn enable_early_data(&mut self) {
-        self.tls_ctx.lock().unwrap().set_early_data_enabled(true);
+        self.tls_ctx.set_early_data_enabled(true);
     }
 
     /// Configures the list of supported application protocols.
@@ -728,7 +829,7 @@ impl Config {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn set_application_protos(&mut self, protos: &[u8]) -> Result<()> {
-        let mut b = octets::Octets::with_slice(&protos);
+        let mut b = octets::Octets::with_slice(protos);
 
         let mut protos_list = Vec::new();
 
@@ -738,10 +839,7 @@ impl Config {
 
         self.application_protos = protos_list;
 
-        self.tls_ctx
-            .lock()
-            .unwrap()
-            .set_alpn(&self.application_protos)
+        self.tls_ctx.set_alpn(&self.application_protos)
     }
 
     /// Sets the `max_idle_timeout` transport parameter, in milliseconds.
@@ -921,6 +1019,20 @@ impl Config {
         self.dgram_recv_max_queue_len = recv_queue_len;
         self.dgram_send_max_queue_len = send_queue_len;
     }
+
+    /// Sets the maximum size of the connection window.
+    ///
+    /// The default value is MAX_CONNECTION_WINDOW (24MBytes).
+    pub fn set_max_connection_window(&mut self, v: u64) {
+        self.max_connection_window = v;
+    }
+
+    /// Sets the maximum size of the stream window.
+    ///
+    /// The default value is MAX_STREAM_WINDOW (16MBytes).
+    pub fn set_max_stream_window(&mut self, v: u64) {
+        self.max_stream_window = v;
+    }
 }
 
 /// A QUIC connection.
@@ -947,11 +1059,7 @@ pub struct Connection {
     local_transport_params: TransportParams,
 
     /// TLS handshake state.
-    ///
-    /// Due to the requirement for `Connection` to be Send+Sync, and the fact
-    /// that BoringSSL's SSL structure is not thread safe, we need to wrap the
-    /// handshake object in a mutex.
-    handshake: Mutex<tls::Handshake>,
+    handshake: tls::Handshake,
 
     /// Serialized TLS session buffer.
     ///
@@ -973,15 +1081,14 @@ pub struct Connection {
     /// Total number of sent packets.
     sent_count: usize,
 
+    /// Total number of packets sent with data retransmitted.
+    retrans_count: usize,
+
     /// Total number of bytes received from the peer.
     rx_data: u64,
 
-    /// Local flow control limit for the connection.
-    max_rx_data: u64,
-
-    /// Updated local flow control limit for the connection. This is used to
-    /// trigger sending MAX_DATA frames after a certain threshold.
-    max_rx_data_next: u64,
+    /// Receiver flow controller.
+    flow_control: flowcontrol::FlowControl,
 
     /// Whether we send MAX_DATA frame.
     almost_full: bool,
@@ -995,9 +1102,22 @@ pub struct Connection {
     /// Peer's flow control limit for the connection.
     max_tx_data: u64,
 
+    /// Last tx_data before running a full send() loop.
+    last_tx_data: u64,
+
     /// Total number of bytes the server can send before the peer's address
     /// is verified.
     max_send_bytes: usize,
+
+    /// Total number of bytes retransmitted over the connection.
+    /// This counts only STREAM and CRYPTO data.
+    stream_retrans_bytes: u64,
+
+    /// Total number of bytes sent over the connection.
+    sent_bytes: u64,
+
+    /// Total number of bytes received over the connection.
+    recv_bytes: u64,
 
     /// Streams map, indexed by stream ID.
     streams: stream::StreamMap,
@@ -1022,7 +1142,7 @@ pub struct Connection {
     peer_error: Option<ConnectionError>,
 
     /// Received path challenge.
-    challenge: Option<Vec<u8>>,
+    challenge: Option<[u8; 8]>,
 
     /// The connection-level limit at which send blocking occurred.
     blocked_limit: Option<u64>,
@@ -1067,8 +1187,11 @@ pub struct Connection {
     /// Whether the connection handshake has been completed.
     handshake_completed: bool,
 
-    /// Whether the HANDSHAKE_DONE has been sent.
+    /// Whether the HANDSHAKE_DONE frame has been sent.
     handshake_done_sent: bool,
+
+    /// Whether the HANDSHAKE_DONE frame has been acked.
+    handshake_done_acked: bool,
 
     /// Whether the connection handshake has been confirmed.
     handshake_confirmed: bool,
@@ -1080,19 +1203,17 @@ pub struct Connection {
     /// Whether the connection is closed.
     closed: bool,
 
+    // Whether the connection was timed out
+    timed_out: bool,
+
     /// Whether to send GREASE.
     grease: bool,
 
     /// TLS keylog writer.
     keylog: Option<Box<dyn std::io::Write + Send + Sync>>,
 
-    /// Qlog streaming output.
     #[cfg(feature = "qlog")]
-    qlog_streamer: Option<qlog::QlogStreamer>,
-
-    /// Whether peer transport parameters were qlogged.
-    #[cfg(feature = "qlog")]
-    qlogged_peer_params: bool,
+    qlog: QlogInfo,
 
     /// DATAGRAM queues.
     dgram_recv_queue: dgram::DatagramQueue,
@@ -1124,7 +1245,7 @@ pub struct Connection {
 pub fn accept(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, from: SocketAddr,
     config: &mut Config,
-) -> Result<Pin<Box<Connection>>> {
+) -> Result<Connection> {
     let conn = Connection::new(scid, odcid, from, config, true)?;
 
     Ok(conn)
@@ -1150,11 +1271,11 @@ pub fn accept(
 pub fn connect(
     server_name: Option<&str>, scid: &ConnectionId, to: SocketAddr,
     config: &mut Config,
-) -> Result<Pin<Box<Connection>>> {
-    let conn = Connection::new(scid, None, to, config, false)?;
+) -> Result<Connection> {
+    let mut conn = Connection::new(scid, None, to, config, false)?;
 
     if let Some(server_name) = server_name {
-        conn.handshake.lock().unwrap().set_host_name(server_name)?;
+        conn.handshake.set_host_name(server_name)?;
     }
 
     Ok(conn)
@@ -1289,40 +1410,94 @@ macro_rules! push_frame_to_pkt {
     }};
 }
 
-/// Conditional qlog action.
+/// Conditional qlog actions.
 ///
 /// Executes the provided body if the qlog feature is enabled and quiche
-/// has been condifigured with a log writer.
+/// has been configured with a log writer.
 macro_rules! qlog_with {
-    ($qlog_streamer:expr, $qlog_streamer_ref:ident, $body:block) => {{
+    ($qlog:expr, $qlog_streamer_ref:ident, $body:block) => {{
         #[cfg(feature = "qlog")]
         {
-            if let Some($qlog_streamer_ref) = &mut $qlog_streamer {
+            if let Some($qlog_streamer_ref) = &mut $qlog.streamer {
                 $body
             }
         }
     }};
 }
 
+/// Executes the provided body if the qlog feature is enabled, quiche has been
+/// configured with a log writer, the event's importance is within the
+/// configured level.
+macro_rules! qlog_with_type {
+    ($ty:expr, $qlog:expr, $qlog_streamer_ref:ident, $body:block) => {{
+        #[cfg(feature = "qlog")]
+        {
+            if EventImportance::from($ty).is_contained_in(&$qlog.level) {
+                if let Some($qlog_streamer_ref) = &mut $qlog.streamer {
+                    $body
+                }
+            }
+        }
+    }};
+}
+
+#[cfg(feature = "qlog")]
+const QLOG_PARAMS_SET: EventType =
+    EventType::TransportEventType(TransportEventType::ParametersSet);
+
+#[cfg(feature = "qlog")]
+const QLOG_PACKET_RX: EventType =
+    EventType::TransportEventType(TransportEventType::PacketReceived);
+
+#[cfg(feature = "qlog")]
+const QLOG_PACKET_TX: EventType =
+    EventType::TransportEventType(TransportEventType::PacketSent);
+
+#[cfg(feature = "qlog")]
+const QLOG_DATA_MV: EventType =
+    EventType::TransportEventType(TransportEventType::DataMoved);
+
+#[cfg(feature = "qlog")]
+const QLOG_METRICS: EventType =
+    EventType::RecoveryEventType(RecoveryEventType::MetricsUpdated);
+
+#[cfg(feature = "qlog")]
+struct QlogInfo {
+    streamer: Option<qlog::streamer::QlogStreamer>,
+    logged_peer_params: bool,
+    level: EventImportance,
+}
+
+#[cfg(feature = "qlog")]
+impl Default for QlogInfo {
+    fn default() -> Self {
+        QlogInfo {
+            streamer: None,
+            logged_peer_params: false,
+            level: EventImportance::Base,
+        }
+    }
+}
+
 impl Connection {
     fn new(
         scid: &ConnectionId, odcid: Option<&ConnectionId>, peer: SocketAddr,
         config: &mut Config, is_server: bool,
-    ) -> Result<Pin<Box<Connection>>> {
-        let tls = config.tls_ctx.lock().unwrap().new_handshake()?;
+    ) -> Result<Connection> {
+        let tls = config.tls_ctx.new_handshake()?;
         Connection::with_tls(scid, odcid, peer, config, tls, is_server)
     }
 
     fn with_tls(
         scid: &ConnectionId, odcid: Option<&ConnectionId>, peer: SocketAddr,
         config: &mut Config, tls: tls::Handshake, is_server: bool,
-    ) -> Result<Pin<Box<Connection>>> {
+    ) -> Result<Connection> {
         let max_rx_data = config.local_transport_params.initial_max_data;
 
         let scid_as_hex: Vec<String> =
             scid.iter().map(|b| format!("{:02x}", b)).collect();
 
-        let mut conn = Box::pin(Connection {
+        let mut conn = Connection {
             version: config.version,
 
             dcid: ConnectionId::default(),
@@ -1340,11 +1515,11 @@ impl Connection {
 
             local_transport_params: config.local_transport_params.clone(),
 
-            handshake: Mutex::new(tls),
+            handshake: tls,
 
             session: None,
 
-            recovery: recovery::Recovery::new(&config),
+            recovery: recovery::Recovery::new(config),
 
             peer_addr: peer,
 
@@ -1352,22 +1527,32 @@ impl Connection {
 
             recv_count: 0,
             sent_count: 0,
+            retrans_count: 0,
+            sent_bytes: 0,
+            recv_bytes: 0,
 
             rx_data: 0,
-            max_rx_data,
-            max_rx_data_next: max_rx_data,
+            flow_control: flowcontrol::FlowControl::new(
+                max_rx_data,
+                cmp::min(max_rx_data / 2 * 3, DEFAULT_CONNECTION_WINDOW),
+                config.max_connection_window,
+            ),
             almost_full: false,
 
             tx_cap: 0,
 
             tx_data: 0,
             max_tx_data: 0,
+            last_tx_data: 0,
+
+            stream_retrans_bytes: 0,
 
             max_send_bytes: 0,
 
             streams: stream::StreamMap::new(
                 config.local_transport_params.initial_max_streams_bidi,
                 config.local_transport_params.initial_max_streams_uni,
+                config.max_stream_window,
             ),
 
             odcid: None,
@@ -1413,6 +1598,7 @@ impl Connection {
             handshake_completed: false,
 
             handshake_done_sent: false,
+            handshake_done_acked: false,
 
             handshake_confirmed: false,
 
@@ -1420,15 +1606,14 @@ impl Connection {
 
             closed: false,
 
+            timed_out: false,
+
             grease: config.grease,
 
             keylog: None,
 
             #[cfg(feature = "qlog")]
-            qlog_streamer: None,
-
-            #[cfg(feature = "qlog")]
-            qlogged_peer_params: false,
+            qlog: Default::default(),
 
             dgram_recv_queue: dgram::DatagramQueue::new(
                 config.dgram_recv_max_queue_len,
@@ -1439,7 +1624,7 @@ impl Connection {
             ),
 
             emit_dgram: true,
-        });
+        };
 
         if let Some(odcid) = odcid {
             conn.local_transport_params
@@ -1454,11 +1639,9 @@ impl Connection {
         conn.local_transport_params.initial_source_connection_id =
             Some(scid.to_vec().into());
 
-        conn.handshake.lock().unwrap().init(&conn)?;
+        conn.handshake.init(is_server)?;
 
         conn.handshake
-            .lock()
-            .unwrap()
             .use_legacy_codepoint(config.version != PROTOCOL_VERSION_V1);
 
         conn.encode_transport_params()?;
@@ -1485,6 +1668,8 @@ impl Connection {
             conn.derived_initial_secrets = true;
         }
 
+        conn.recovery.on_init();
+
         Ok(conn)
     }
 
@@ -1501,14 +1686,36 @@ impl Connection {
 
     /// Sets qlog output to the designated [`Writer`].
     ///
+    /// Only events included in `QlogLevel::Base` are written. The serialization
+    /// format is JSON-SEQ.
+    ///
     /// This needs to be called as soon as the connection is created, to avoid
     /// missing some early logs.
     ///
     /// [`Writer`]: https://doc.rust-lang.org/std/io/trait.Write.html
     #[cfg(feature = "qlog")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
     pub fn set_qlog(
         &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
         description: String,
+    ) {
+        self.set_qlog_with_level(writer, title, description, QlogLevel::Base)
+    }
+
+    /// Sets qlog output to the designated [`Writer`].
+    ///
+    /// Only qlog events included in the specified `QlogLevel` are written. The
+    /// serialization format is JSON-SEQ.
+    ///
+    /// This needs to be called as soon as the connection is created, to avoid
+    /// missing some early logs.
+    ///
+    /// [`Writer`]: https://doc.rust-lang.org/std/io/trait.Write.html
+    #[cfg(feature = "qlog")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
+    pub fn set_qlog_with_level(
+        &mut self, writer: Box<dyn std::io::Write + Send + Sync>, title: String,
+        description: String, qlog_level: QlogLevel,
     ) {
         let vp = if self.is_server {
             qlog::VantagePointType::Server
@@ -1516,7 +1723,17 @@ impl Connection {
             qlog::VantagePointType::Client
         };
 
-        let trace = qlog::Trace::new(
+        let level = match qlog_level {
+            QlogLevel::Core => EventImportance::Core,
+
+            QlogLevel::Base => EventImportance::Base,
+
+            QlogLevel::Extra => EventImportance::Extra,
+        };
+
+        self.qlog.level = level;
+
+        let trace = qlog::TraceSeq::new(
             qlog::VantagePoint {
                 name: None,
                 ty: vp,
@@ -1525,37 +1742,33 @@ impl Connection {
             Some(title.to_string()),
             Some(description.to_string()),
             Some(qlog::Configuration {
-                time_offset: Some("0".to_string()),
-                time_units: Some(qlog::TimeUnits::Ms),
+                time_offset: Some(0.0),
                 original_uris: None,
             }),
             None,
         );
 
-        let mut streamer = qlog::QlogStreamer::new(
+        let mut streamer = qlog::streamer::QlogStreamer::new(
             qlog::QLOG_VERSION.to_string(),
             Some(title),
             Some(description),
             None,
-            std::time::Instant::now(),
+            time::Instant::now(),
             trace,
+            self.qlog.level.clone(),
             writer,
         );
 
         streamer.start_log().ok();
 
-        let handshake = self.handshake.lock().unwrap();
+        let ev_data = self
+            .local_transport_params
+            .to_qlog(TransportOwner::Local, self.handshake.cipher());
 
-        let ev = self.local_transport_params.to_qlog(
-            qlog::TransportOwner::Local,
-            self.version,
-            handshake.alpn_protocol(),
-            handshake.cipher(),
-        );
+        // This event occurs very early, so just mark the relative time as 0.0.
+        streamer.add_event(Event::with_time(0.0, ev_data)).ok();
 
-        streamer.add_event(ev).ok();
-
-        self.qlog_streamer = Some(streamer);
+        self.qlog.streamer = Some(streamer);
     }
 
     /// Configures the given session for resumption.
@@ -1574,10 +1787,7 @@ impl Connection {
         let session_len = b.get_u64()? as usize;
         let session_bytes = b.get_bytes(session_len)?;
 
-        self.handshake
-            .lock()
-            .unwrap()
-            .set_session(session_bytes.as_ref())?;
+        self.handshake.set_session(session_bytes.as_ref())?;
 
         let raw_params_len = b.get_u64()? as usize;
         let raw_params_bytes = b.get_bytes(raw_params_len)?;
@@ -1803,7 +2013,7 @@ impl Connection {
             // Reset connection state to force sending another Initial packet.
             self.drop_epoch_state(packet::EPOCH_INITIAL, now);
             self.got_peer_conn_id = false;
-            self.handshake.lock().unwrap().clear()?;
+            self.handshake.clear()?;
 
             self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_open =
                 Some(aead_open);
@@ -1811,8 +2021,6 @@ impl Connection {
                 Some(aead_seal);
 
             self.handshake
-                .lock()
-                .unwrap()
                 .use_legacy_codepoint(self.version != PROTOCOL_VERSION_V1);
 
             // Encode transport parameters again, as the new version might be
@@ -1862,7 +2070,7 @@ impl Connection {
             // Reset connection state to force sending another Initial packet.
             self.drop_epoch_state(packet::EPOCH_INITIAL, now);
             self.got_peer_conn_id = false;
-            self.handshake.lock().unwrap().clear()?;
+            self.handshake.clear()?;
 
             self.pkt_num_spaces[packet::EPOCH_INITIAL].crypto_open =
                 Some(aead_open);
@@ -1881,8 +2089,6 @@ impl Connection {
             self.did_version_negotiation = true;
 
             self.handshake
-                .lock()
-                .unwrap()
                 .use_legacy_codepoint(self.version != PROTOCOL_VERSION_V1);
 
             // Encode transport parameters again, as the new version might be
@@ -1984,7 +2190,7 @@ impl Connection {
 
         let aead_tag_len = aead.alg().tag_len();
 
-        packet::decrypt_hdr(&mut b, &mut hdr, &aead).map_err(|e| {
+        packet::decrypt_hdr(&mut b, &mut hdr, aead).map_err(|e| {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
         })?;
 
@@ -2004,36 +2210,15 @@ impl Connection {
             pn
         );
 
-        qlog_with!(self.qlog_streamer, q, {
-            let packet_size = b.len();
-
-            let qlog_pkt_hdr = qlog::PacketHeader::with_type(
-                hdr.ty.to_qlog(),
-                pn,
-                Some(packet_size as u64),
-                Some(payload_len as u64),
-                Some(hdr.version),
-                Some(&hdr.scid),
-                Some(&hdr.dcid),
-            );
-
-            q.add_event(qlog::event::Event::packet_received(
-                hdr.ty.to_qlog(),
-                qlog_pkt_hdr,
-                Some(Vec::new()),
-                None,
-                None,
-                None,
-            ))
-            .ok();
-        });
+        #[cfg(feature = "qlog")]
+        let mut qlog_frames = vec![];
 
         let mut payload = packet::decrypt_pkt(
             &mut b,
             pn,
             pn_len,
             payload_len,
-            &aead,
+            aead,
         )
         .map_err(|e| {
             drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
@@ -2083,12 +2268,15 @@ impl Connection {
         // ACK and PADDING.
         let mut ack_elicited = false;
 
-        // Process packet payload.
+        // Process packet payload. If a frame cannot be processed, store the
+        // error and stop further packet processing.
+        let mut frame_processing_err = None;
+
         while payload.cap() > 0 {
             let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
 
-            qlog_with!(self.qlog_streamer, q, {
-                q.add_frame(frame.to_qlog(), false).ok();
+            qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
+                qlog_frames.push(frame.to_qlog());
             });
 
             if frame.ack_eliciting() {
@@ -2096,43 +2284,68 @@ impl Connection {
             }
 
             if let Err(e) = self.process_frame(frame, epoch, now) {
-                qlog_with!(self.qlog_streamer, q, {
-                    // Always conclude frame writing on error.
-                    q.finish_frames().ok();
-                });
-
-                return Err(e);
+                frame_processing_err = Some(e);
+                break;
             }
         }
 
-        qlog_with!(self.qlog_streamer, q, {
-            // Always conclude frame writing.
-            q.finish_frames().ok();
+        qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
+            let packet_size = b.len();
+
+            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
+                hdr.ty.to_qlog(),
+                pn,
+                Some(hdr.version),
+                Some(&hdr.scid),
+                Some(&hdr.dcid),
+            );
+
+            let qlog_raw_info = RawInfo {
+                length: Some(packet_size as u64),
+                payload_length: Some(payload_len as u64),
+                data: None,
+            };
+
+            let ev_data =
+                EventData::PacketReceived(qlog::events::quic::PacketReceived {
+                    header: qlog_pkt_hdr,
+                    frames: Some(qlog_frames),
+                    is_coalesced: None,
+                    retry_token: None,
+                    stateless_reset_token: None,
+                    supported_versions: None,
+                    raw: Some(qlog_raw_info),
+                    datagram_id: None,
+                    trigger: None,
+                });
+
+            q.add_event_data_with_instant(ev_data, now).ok();
         });
 
-        qlog_with!(self.qlog_streamer, q, {
-            let ev = self.recovery.to_qlog();
-            q.add_event(ev).ok();
+        qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
+            if let Some(ev_data) = self.recovery.maybe_qlog() {
+                q.add_event_data_with_instant(ev_data, now).ok();
+            }
         });
+
+        if let Some(e) = frame_processing_err {
+            // Any frame error is terminal, so now just return.
+            return Err(e);
+        }
 
         // Only log the remote transport parameters once the connection is
         // established (i.e. after frames have been fully parsed) and only
         // once per connection.
         if self.is_established() {
-            qlog_with!(self.qlog_streamer, q, {
-                if !self.qlogged_peer_params {
-                    let handshake = self.handshake.lock().unwrap();
+            qlog_with_type!(QLOG_PARAMS_SET, self.qlog, q, {
+                if !self.qlog.logged_peer_params {
+                    let ev_data = self
+                        .peer_transport_params
+                        .to_qlog(TransportOwner::Remote, self.handshake.cipher());
 
-                    let ev = self.peer_transport_params.to_qlog(
-                        qlog::TransportOwner::Remote,
-                        self.version,
-                        handshake.alpn_protocol(),
-                        handshake.cipher(),
-                    );
+                    q.add_event_data_with_instant(ev_data, now).ok();
 
-                    q.add_event(ev).ok();
-
-                    self.qlogged_peer_params = true;
+                    self.qlog.logged_peer_params = true;
                 }
             });
         }
@@ -2181,6 +2394,14 @@ impl Connection {
                     }
                 },
 
+                frame::Frame::HandshakeDone => {
+                    // Explicitly set this to true, so that if the frame was
+                    // already scheduled for retransmission, it is aborted.
+                    self.handshake_done_sent = true;
+
+                    self.handshake_done_acked = true;
+                },
+
                 frame::Frame::ResetStream { stream_id, .. } => {
                     let stream = match self.streams.get_mut(stream_id) {
                         Some(v) => v,
@@ -2222,14 +2443,13 @@ impl Connection {
         }
 
         // Update send capacity.
-        self.tx_cap = cmp::min(
-            self.recovery.cwnd_available() as u64,
-            self.max_tx_data - self.tx_data,
-        ) as usize;
+        self.update_tx_cap();
 
         self.recv_count += 1;
 
         let read = b.off() + aead_tag_len;
+
+        self.recv_bytes += read as u64;
 
         // An Handshake packet has been received from the client and has been
         // successfully processed, so we can drop the initial state and consider
@@ -2260,14 +2480,18 @@ impl Connection {
     ///  * When the connection timer expires (that is, any time [`on_timeout()`]
     ///    is also called).
     ///
-    ///  * When the application sends data to the peer (for examples, any time
+    ///  * When the application sends data to the peer (for example, any time
     ///    [`stream_send()`] or [`stream_shutdown()`] are called).
+    ///
+    ///  * When the application receives data from the peer (for example any
+    ///    time [`stream_recv()`] is called).
     ///
     /// [`Done`]: enum.Error.html#variant.Done
     /// [`recv()`]: struct.Connection.html#method.recv
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
     /// [`stream_send()`]: struct.Connection.html#method.stream_send
     /// [`stream_shutdown()`]: struct.Connection.html#method.stream_shutdown
+    /// [`stream_recv()`]: struct.Connection.html#method.stream_recv
     ///
     /// ## Examples:
     ///
@@ -2386,6 +2610,8 @@ impl Connection {
         }
 
         if done == 0 {
+            self.last_tx_data = self.tx_data;
+
             return Err(Error::Done);
         }
 
@@ -2403,10 +2629,7 @@ impl Connection {
         let info = SendInfo {
             to: self.peer_addr,
 
-            at: self
-                .recovery
-                .get_packet_send_time()
-                .unwrap_or_else(time::Instant::now),
+            at: self.recovery.get_packet_send_time(),
         };
 
         Ok((done, info))
@@ -2441,6 +2664,10 @@ impl Connection {
                         .crypto_stream
                         .send
                         .retransmit(offset, length);
+
+                    self.stream_retrans_bytes += length as u64;
+
+                    self.retrans_count += 1;
                 },
 
                 frame::Frame::StreamHeader {
@@ -2475,6 +2702,10 @@ impl Connection {
                             incremental,
                         );
                     }
+
+                    self.stream_retrans_bytes += length as u64;
+
+                    self.retrans_count += 1;
                 },
 
                 frame::Frame::ACK { .. } => {
@@ -2491,7 +2722,9 @@ impl Connection {
                             .mark_reset(stream_id, true, error_code, final_size);
                     },
 
-                frame::Frame::HandshakeDone => {
+                // Retransmit HANDSHAKE_DONE only if it hasn't been acked at
+                // least once already.
+                frame::Frame::HandshakeDone if !self.handshake_done_acked => {
                     self.handshake_done_sent = false;
                 },
 
@@ -2616,6 +2849,7 @@ impl Connection {
             let frame = frame::Frame::ACK {
                 ack_delay,
                 ranges: self.pkt_num_spaces[epoch].recv_pkt_need_ack.clone(),
+                ecn_counts: None, // sending ECN is not supported at this time
             };
 
             if push_frame_to_pkt!(b, frames, frame, left) {
@@ -2625,10 +2859,7 @@ impl Connection {
 
         if pkt_type == packet::Type::Short && !is_closing {
             // Create HANDSHAKE_DONE frame.
-            if self.is_established() &&
-                !self.handshake_done_sent &&
-                self.is_server
-            {
+            if self.should_send_handshake_done() {
                 let frame = frame::Frame::HandshakeDone;
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
@@ -2692,18 +2923,29 @@ impl Connection {
                     },
                 };
 
+                // Autotune the stream window size.
+                stream.recv.autotune_window(now, self.recovery.rtt());
+
                 let frame = frame::Frame::MaxStreamData {
                     stream_id,
                     max: stream.recv.max_data_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
-                    stream.recv.update_max_data();
+                    let recv_win = stream.recv.window();
+
+                    stream.recv.update_max_data(now);
 
                     self.streams.mark_almost_full(stream_id, false);
 
                     ack_eliciting = true;
                     in_flight = true;
+
+                    // Make sure the connection window always has some
+                    // room compared to the stream window.
+                    self.flow_control.ensure_window_lower_bound(
+                        (recv_win as f64 * CONNECTION_WINDOW_FACTOR) as u64,
+                    );
 
                     // Also send MAX_DATA when MAX_STREAM_DATA is sent, to avoid a
                     // potential race condition.
@@ -2712,16 +2954,19 @@ impl Connection {
             }
 
             // Create MAX_DATA frame as needed.
-            if self.almost_full && self.max_rx_data < self.max_rx_data_next {
+            if self.almost_full && self.max_rx_data() < self.max_rx_data_next() {
+                // Autotune the connection window size.
+                self.flow_control.autotune_window(now, self.recovery.rtt());
+
                 let frame = frame::Frame::MaxData {
-                    max: self.max_rx_data_next,
+                    max: self.max_rx_data_next(),
                 };
 
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     self.almost_full = false;
 
                     // Commits the new max_rx_data limit.
-                    self.max_rx_data = self.max_rx_data_next;
+                    self.flow_control.update_max_data(now);
 
                     ack_eliciting = true;
                     in_flight = true;
@@ -2823,10 +3068,8 @@ impl Connection {
         }
 
         // Create PATH_RESPONSE frame.
-        if let Some(ref challenge) = self.challenge {
-            let frame = frame::Frame::PathResponse {
-                data: challenge.clone(),
-            };
+        if let Some(challenge) = self.challenge {
+            let frame = frame::Frame::PathResponse { data: challenge };
 
             if push_frame_to_pkt!(b, frames, frame, left) {
                 self.challenge = None;
@@ -2926,11 +3169,55 @@ impl Connection {
         {
             if let Some(max_dgram_payload) = self.dgram_max_writable_len() {
                 while let Some(len) = self.dgram_send_queue.peek_front_len() {
-                    if (len + frame::MAX_DGRAM_OVERHEAD) <= left {
-                        // Front of the queue fits this packet, send it
+                    let hdr_off = b.off();
+                    let hdr_len = 1 + // frame type
+                        2; // length, always encode as 2-byte varint
+
+                    if (hdr_len + len) <= left {
+                        // Front of the queue fits this packet, send it.
                         match self.dgram_send_queue.pop() {
                             Some(data) => {
-                                let frame = frame::Frame::Datagram { data };
+                                // Encode the frame.
+                                //
+                                // Instead of creating a `frame::Frame` object,
+                                // encode the frame directly into the packet
+                                // buffer.
+                                //
+                                // First we reserve some space in the output
+                                // buffer for writing the frame header (we
+                                // assume the length field is always a 2-byte
+                                // varint as we don't know the value yet).
+                                //
+                                // Then we emit the data from the DATAGRAM's
+                                // buffer.
+                                //
+                                // Finally we go back and encode the frame
+                                // header with the now available information.
+                                let (mut dgram_hdr, mut dgram_payload) =
+                                    b.split_at(hdr_off + hdr_len)?;
+
+                                dgram_payload.as_mut()[..len]
+                                    .copy_from_slice(&data);
+
+                                // Encode the frame's header.
+                                //
+                                // Due to how `OctetsMut::split_at()` works,
+                                // `dgram_hdr` starts from the initial offset
+                                // of `b` (rather than the current offset), so
+                                // it needs to be advanced to the initial frame
+                                // offset.
+                                dgram_hdr.skip(hdr_off)?;
+
+                                frame::encode_dgram_header(
+                                    len as u64,
+                                    &mut dgram_hdr,
+                                )?;
+
+                                // Advance the packet buffer's offset.
+                                b.skip(hdr_len + len)?;
+
+                                let frame =
+                                    frame::Frame::DatagramHeader { length: len };
 
                                 if push_frame_to_pkt!(b, frames, frame, left) {
                                     ack_eliciting = true;
@@ -2980,9 +3267,8 @@ impl Connection {
                 // directly into the packet buffer.
                 //
                 // First we reserve some space in the output buffer for writing
-                // the frame header (we assume the length field is
-                // always a 2-byte varint as we don't know the
-                // value yet).
+                // the frame header (we assume the length field is always a
+                // 2-byte varint as we don't know the value yet).
                 //
                 // Then we emit the data from the stream's send buffer.
                 //
@@ -3061,7 +3347,7 @@ impl Connection {
         // Alternate trying to send DATAGRAMs next time.
         self.emit_dgram = !dgram_emitted;
 
-        // Create PING for PTO probe if no other ack-elicitng frame is sent.
+        // Create PING for PTO probe if no other ack-eliciting frame is sent.
         if self.recovery.loss_probes[epoch] > 0 &&
             !ack_eliciting &&
             left >= 1 &&
@@ -3115,11 +3401,10 @@ impl Connection {
         }
 
         let payload_len = b.off() - payload_offset;
-        let payload_len = payload_len + crypto_overhead;
 
         // Fill in payload length.
         if pkt_type != packet::Type::Short {
-            let len = pn_len + payload_len;
+            let len = pn_len + payload_len + crypto_overhead;
 
             let (_, mut payload_with_len) = b.split_at(header_offset)?;
             payload_with_len
@@ -3134,41 +3419,50 @@ impl Connection {
             pn
         );
 
-        qlog_with!(self.qlog_streamer, q, {
-            let qlog_pkt_hdr = qlog::PacketHeader::with_type(
+        #[cfg(feature = "qlog")]
+        let mut qlog_frames = Vec::with_capacity(frames.len());
+
+        for frame in &mut frames {
+            trace!("{} tx frm {:?}", self.trace_id, frame);
+
+            qlog_with_type!(QLOG_PACKET_TX, self.qlog, _q, {
+                qlog_frames.push(frame.to_qlog());
+            });
+        }
+
+        qlog_with_type!(QLOG_PACKET_TX, self.qlog, q, {
+            let qlog_pkt_hdr = qlog::events::quic::PacketHeader::with_type(
                 hdr.ty.to_qlog(),
                 pn,
-                Some(payload_len as u64 + payload_offset as u64),
-                Some(payload_len as u64),
                 Some(hdr.version),
                 Some(&hdr.scid),
                 Some(&hdr.dcid),
             );
 
-            let packet_sent_ev = qlog::event::Event::packet_sent_min(
-                hdr.ty.to_qlog(),
-                qlog_pkt_hdr,
-                Some(Vec::new()),
-            );
+            // Qlog packet raw info described at
+            // https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema-00#section-5.1
+            //
+            // `length` includes packet headers and trailers (AEAD tag).
+            let length = payload_len + payload_offset + crypto_overhead;
+            let qlog_raw_info = RawInfo {
+                length: Some(length as u64),
+                payload_length: Some(payload_len as u64),
+                data: None,
+            };
 
-            q.add_event(packet_sent_ev).ok();
-        });
-
-        for frame in &mut frames {
-            trace!("{} tx frm {:?}", self.trace_id, frame);
-
-            qlog_with!(self.qlog_streamer, q, {
-                q.add_frame(frame.to_qlog(), false).ok();
+            let ev_data = EventData::PacketSent(qlog::events::quic::PacketSent {
+                header: qlog_pkt_hdr,
+                frames: Some(qlog_frames),
+                is_coalesced: None,
+                retry_token: None,
+                stateless_reset_token: None,
+                supported_versions: None,
+                raw: Some(qlog_raw_info),
+                datagram_id: None,
+                trigger: None,
             });
 
-            // Once frames have been serialized they are passed to the Recovery
-            // module which manages retransmission. However, some frames do not
-            // contain retransmittable data, so drop it here.
-            frame.shrink_for_retransmission();
-        }
-
-        qlog_with!(self.qlog_streamer, q, {
-            q.finish_frames().ok();
+            q.add_event_data_with_instant(ev_data, now).ok();
         });
 
         let aead = match self.pkt_num_spaces[epoch].crypto_seal {
@@ -3182,6 +3476,7 @@ impl Connection {
             pn_len,
             payload_len,
             payload_offset,
+            None,
             aead,
         )?;
 
@@ -3196,10 +3491,14 @@ impl Connection {
             in_flight,
             delivered: 0,
             delivered_time: now,
-            recent_delivered_packet_sent_time: now,
+            first_sent_time: now,
             is_app_limited: false,
             has_data,
         };
+
+        if in_flight && self.delivery_rate_check_if_app_limited() {
+            self.recovery.delivery_rate_update_app_limited(true);
+        }
 
         self.recovery.on_packet_sent(
             sent_pkt,
@@ -3209,14 +3508,16 @@ impl Connection {
             &self.trace_id,
         );
 
-        qlog_with!(self.qlog_streamer, q, {
-            let ev = self.recovery.to_qlog();
-            q.add_event(ev).ok();
+        qlog_with_type!(QLOG_METRICS, self.qlog, q, {
+            if let Some(ev_data) = self.recovery.maybe_qlog() {
+                q.add_event_data_with_instant(ev_data, now).ok();
+            }
         });
 
         self.pkt_num_spaces[epoch].next_pkt_num += 1;
 
         self.sent_count += 1;
+        self.sent_bytes += written as u64;
 
         if self.dgram_send_queue.byte_size() > self.recovery.cwnd_available() {
             self.recovery.update_app_limited(false);
@@ -3244,6 +3545,19 @@ impl Connection {
         Ok((pkt_type, written))
     }
 
+    /// Returns the size of the send quantum, in bytes.
+    ///
+    /// This represents the maximum size of a packet burst as determined by the
+    /// congestion control algorithm in use.
+    ///
+    /// Applications can, for example, use it in conjuction with segmentatation
+    /// offloading mechanisms as the maximum limit for outgoing aggregates of
+    /// multiple packets.
+    #[inline]
+    pub fn send_quantum(&mut self) -> usize {
+        self.recovery.send_quantum()
+    }
+
     /// Reads contiguous data from a stream into the provided slice.
     ///
     /// The slice must be sized by the caller and will be populated up to its
@@ -3252,7 +3566,11 @@ impl Connection {
     /// On success the amount of bytes read and a flag indicating the fin state
     /// is returned as a tuple, or [`Done`] if there is no data to read.
     ///
+    /// Reading data from a stream may trigger queueing of control messages
+    /// (e.g. MAX_STREAM_DATA). [`send()`] should be called after reading.
+    ///
     /// [`Done`]: enum.Error.html#variant.Done
+    /// [`send()`]: struct.Connection.html#method.send
     ///
     /// ## Examples:
     ///
@@ -3288,18 +3606,33 @@ impl Connection {
             return Err(Error::Done);
         }
 
+        let local = stream.local;
+
         #[cfg(feature = "qlog")]
         let offset = stream.recv.off_front();
 
-        let (read, fin) = stream.recv.emit(out)?;
+        let (read, fin) = match stream.recv.emit(out) {
+            Ok(v) => v,
 
-        self.max_rx_data_next = self.max_rx_data_next.saturating_add(read as u64);
+            Err(e) => {
+                // Collect the stream if it is now complete. This can happen if
+                // we got a `StreamReset` error which will now be propagated to
+                // the application, so we don't need to keep the stream's state
+                // anymore.
+                if stream.is_complete() {
+                    self.streams.collect(stream_id, local);
+                }
+
+                self.streams.mark_readable(stream_id, false);
+                return Err(e);
+            },
+        };
+
+        self.flow_control.add_consumed(read as u64);
 
         let readable = stream.is_readable();
 
         let complete = stream.is_complete();
-
-        let local = stream.local;
 
         if stream.recv.almost_full() {
             self.streams.mark_almost_full(stream_id, true);
@@ -3313,16 +3646,18 @@ impl Connection {
             self.streams.collect(stream_id, local);
         }
 
-        qlog_with!(self.qlog_streamer, q, {
-            let ev = qlog::event::Event::h3_data_moved(
-                stream_id.to_string(),
-                Some(offset.to_string()),
-                Some(read as u64),
-                Some(qlog::H3DataRecipient::Transport),
-                None,
-                None,
-            );
-            q.add_event(ev).ok();
+        qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
+            let ev_data = EventData::DataMoved(qlog::events::quic::DataMoved {
+                stream_id: Some(stream_id),
+                offset: Some(offset),
+                length: Some(read as u64),
+                from: Some(DataRecipient::Transport),
+                to: Some(DataRecipient::Application),
+                data: None,
+            });
+
+            let now = time::Instant::now();
+            q.add_event_data_with_instant(ev_data, now).ok();
         });
 
         if self.should_update_max_data() {
@@ -3336,6 +3671,11 @@ impl Connection {
     ///
     /// On success the number of bytes written is returned, or [`Done`] if no
     /// data was written (e.g. because the stream has no capacity).
+    ///
+    /// Applications can provide a 0-length buffer with the fin flag set to
+    /// true. This will lead to a 0-length FIN STREAM frame being sent at the
+    /// latest offset. The `Ok(0)` value is only returned when the application
+    /// provided a 0-length buffer.
     ///
     /// In addition, if the peer has signalled that it doesn't want to receive
     /// any more data from this stream by sending the `STOP_SENDING` frame, the
@@ -3394,7 +3734,13 @@ impl Connection {
 
         // Truncate the input buffer based on the connection's send capacity if
         // necessary.
+        //
+        // When the cap is zero, the method returns Ok(0) *only* when the passed
+        // buffer is empty. We return Error::Done otherwise.
         let cap = self.tx_cap;
+        if cap == 0 && !(fin && buf.is_empty()) {
+            return Err(Error::Done);
+        }
 
         let (buf, fin) = if cap < buf.len() {
             (&buf[..cap], false)
@@ -3431,8 +3777,12 @@ impl Connection {
         if sent < buf.len() {
             let max_off = stream.send.max_off();
 
-            self.streams.mark_blocked(stream_id, true, max_off);
+            if stream.send.blocked_at() != Some(max_off) {
+                stream.send.update_blocked_at(Some(max_off));
+                self.streams.mark_blocked(stream_id, true, max_off);
+            }
         } else {
+            stream.send.update_blocked_at(None);
             self.streams.mark_blocked(stream_id, false, 0);
         }
 
@@ -3453,19 +3803,23 @@ impl Connection {
 
         self.tx_data += sent as u64;
 
-        self.recovery.rate_check_app_limited();
+        qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
+            let ev_data = EventData::DataMoved(qlog::events::quic::DataMoved {
+                stream_id: Some(stream_id),
+                offset: Some(offset),
+                length: Some(sent as u64),
+                from: Some(DataRecipient::Application),
+                to: Some(DataRecipient::Transport),
+                data: None,
+            });
 
-        qlog_with!(self.qlog_streamer, q, {
-            let ev = qlog::event::Event::h3_data_moved(
-                stream_id.to_string(),
-                Some(offset.to_string()),
-                Some(sent as u64),
-                None,
-                Some(qlog::H3DataRecipient::Transport),
-                None,
-            );
-            q.add_event(ev).ok();
+            let now = time::Instant::now();
+            q.add_event_data_with_instant(ev_data, now).ok();
         });
+
+        if sent == 0 && !buf.is_empty() {
+            return Err(Error::Done);
+        }
 
         Ok(sent)
     }
@@ -3540,7 +3894,14 @@ impl Connection {
             },
 
             Shutdown::Write => {
-                let final_size = stream.send.shutdown()?;
+                let (final_size, unsent) = stream.send.shutdown()?;
+
+                // Claw back some flow control allowance from data that was
+                // buffered but not actually sent before the stream was reset.
+                self.tx_data = self.tx_data.saturating_sub(unsent);
+
+                // Update send capacity.
+                self.update_tx_cap();
 
                 self.streams.mark_reset(stream_id, true, err, final_size);
 
@@ -3583,6 +3944,50 @@ impl Connection {
         };
 
         stream.is_readable()
+    }
+
+    /// Returns true if the stream has enough send capacity.
+    ///
+    /// When `len` more bytes can be buffered into the given stream's send
+    /// buffer, `true` will be returned, `false` otherwise.
+    ///
+    /// In the latter case, if the additional data can't be buffered due to
+    /// flow control limits, the peer will also be notified.
+    ///
+    /// If the specified stream doesn't exist (including when it has already
+    /// been completed and closed), the [`InvalidStreamState`] error will be
+    /// returned.
+    ///
+    /// In addition, if the peer has signalled that it doesn't want to receive
+    /// any more data from this stream by sending the `STOP_SENDING` frame, the
+    /// [`StreamStopped`] error will be returned.
+    ///
+    /// [`InvalidStreamState`]: enum.Error.html#variant.InvalidStreamState
+    /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
+    #[inline]
+    pub fn stream_writable(
+        &mut self, stream_id: u64, len: usize,
+    ) -> Result<bool> {
+        if self.stream_capacity(stream_id)? >= len {
+            return Ok(true);
+        }
+
+        let stream = match self.streams.get(stream_id) {
+            Some(v) => v,
+
+            None => return Err(Error::InvalidStreamState(stream_id)),
+        };
+
+        if self.max_tx_data - self.tx_data < len as u64 {
+            self.blocked_limit = Some(self.max_tx_data);
+        }
+
+        if stream.send.cap()? < len {
+            let max_off = stream.send.max_off();
+            self.streams.mark_blocked(stream_id, true, max_off);
+        }
+
+        Ok(false)
     }
 
     /// Returns true if all the data has been read from the specified stream.
@@ -3810,6 +4215,21 @@ impl Connection {
         }
     }
 
+    /// Reads the first received DATAGRAM.
+    ///
+    /// This is the same as [`dgram_recv()`] but returns the DATAGRAM as a
+    /// `Vec<u8>` instead of copying into the provided buffer.
+    ///
+    /// [`dgram_recv()`]: struct.Connection.html#method.dgram_recv
+    #[inline]
+    pub fn dgram_recv_vec(&mut self) -> Result<Vec<u8>> {
+        match self.dgram_recv_queue.pop() {
+            Some(d) => Ok(d),
+
+            None => Err(Error::Done),
+        }
+    }
+
     /// Reads the first received DATAGRAM without removing it from the queue.
     ///
     /// On success the DATAGRAM's data is returned along with the actual number
@@ -3891,10 +4311,35 @@ impl Connection {
     /// ```
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
-            Some(v) => v as usize,
-            None => {
-                return Err(Error::InvalidState);
-            },
+            Some(v) => v,
+
+            None => return Err(Error::InvalidState),
+        };
+
+        if buf.len() > max_payload_len {
+            return Err(Error::BufferTooShort);
+        }
+
+        self.dgram_send_queue.push(buf.to_vec())?;
+
+        if self.dgram_send_queue.byte_size() > self.recovery.cwnd_available() {
+            self.recovery.update_app_limited(false);
+        }
+
+        Ok(())
+    }
+
+    /// Sends data in a DATAGRAM frame.
+    ///
+    /// This is the same as [`dgram_send()`] but takes a `Vec<u8>` instead of
+    /// a slice.
+    ///
+    /// [`dgram_send()`]: struct.Connection.html#method.dgram_send
+    pub fn dgram_send_vec(&mut self, buf: Vec<u8>) -> Result<()> {
+        let max_payload_len = match self.dgram_max_writable_len() {
+            Some(v) => v,
+
+            None => return Err(Error::InvalidState),
         };
 
         if buf.len() > max_payload_len {
@@ -4013,7 +4458,7 @@ impl Connection {
             let now = time::Instant::now();
 
             if timeout <= now {
-                return Some(time::Duration::new(0, 0));
+                return Some(time::Duration::ZERO);
             }
 
             return Some(timeout.duration_since(now));
@@ -4032,7 +4477,7 @@ impl Connection {
             if draining_timer <= now {
                 trace!("{} draining timeout expired", self.trace_id);
 
-                qlog_with!(self.qlog_streamer, q, {
+                qlog_with!(self.qlog, q, {
                     q.finish_log().ok();
                 });
 
@@ -4049,11 +4494,12 @@ impl Connection {
             if timer <= now {
                 trace!("{} idle timeout expired", self.trace_id);
 
-                qlog_with!(self.qlog_streamer, q, {
+                qlog_with!(self.qlog, q, {
                     q.finish_log().ok();
                 });
 
                 self.closed = true;
+                self.timed_out = true;
                 return;
             }
         }
@@ -4068,12 +4514,11 @@ impl Connection {
                     &self.trace_id,
                 );
 
-                qlog_with!(self.qlog_streamer, q, {
-                    let ev = self.recovery.to_qlog();
-                    q.add_event(ev).ok();
+                qlog_with_type!(QLOG_METRICS, self.qlog, q, {
+                    if let Some(ev_data) = self.recovery.maybe_qlog() {
+                        q.add_event_data_with_instant(ev_data, now).ok();
+                    }
                 });
-
-                return;
             }
         }
     }
@@ -4136,10 +4581,16 @@ impl Connection {
         self.alpn.as_ref()
     }
 
+    /// Returns the server name requested by the client.
+    #[inline]
+    pub fn server_name(&self) -> Option<&str> {
+        self.handshake.server_name()
+    }
+
     /// Returns the peer's leaf certificate (if any) as a DER-encoded buffer.
     #[inline]
-    pub fn peer_cert(&self) -> Option<Vec<u8>> {
-        self.handshake.lock().unwrap().peer_cert()
+    pub fn peer_cert(&self) -> Option<&[u8]> {
+        self.handshake.peer_cert()
     }
 
     /// Returns the serialized cryptographic session for the connection.
@@ -4149,8 +4600,8 @@ impl Connection {
     ///
     /// [`set_session()`]: struct.Connection.html#method.set_session
     #[inline]
-    pub fn session(&self) -> Option<Vec<u8>> {
-        self.session.clone()
+    pub fn session(&self) -> Option<&[u8]> {
+        self.session.as_deref()
     }
 
     /// Returns the source connection ID.
@@ -4180,14 +4631,14 @@ impl Connection {
     /// Returns true if the connection is resumed.
     #[inline]
     pub fn is_resumed(&self) -> bool {
-        self.handshake.lock().unwrap().is_resumed()
+        self.handshake.is_resumed()
     }
 
     /// Returns true if the connection has a pending handshake that has
     /// progressed enough to send or receive early data.
     #[inline]
     pub fn is_in_early_data(&self) -> bool {
-        self.handshake.lock().unwrap().is_in_early_data()
+        self.handshake.is_in_early_data()
     }
 
     /// Returns whether there is stream or DATAGRAM data available to read.
@@ -4222,19 +4673,36 @@ impl Connection {
         self.closed
     }
 
+    /// Returns true if the connection was closed due to the idle timeout.
+    #[inline]
+    pub fn is_timed_out(&self) -> bool {
+        self.timed_out
+    }
+
     /// Returns the error received from the peer, if any.
-    ///
-    /// The values contained in the tuple are symmetric with the [`close()`]
-    /// method.
     ///
     /// Note that a `Some` return value does not necessarily imply
     /// [`is_closed()`] or any other connection state.
     ///
-    /// [`close()`]: struct.Connection.html#method.close
     /// [`is_closed()`]: struct.Connection.html#method.is_closed
     #[inline]
     pub fn peer_error(&self) -> Option<&ConnectionError> {
         self.peer_error.as_ref()
+    }
+
+    /// Returns the error [`close()`] was called with, or internally
+    /// created quiche errors, if any.
+    ///
+    /// Note that a `Some` return value does not necessarily imply
+    /// [`is_closed()`] or any other connection state.
+    /// `Some` also does not guarantee that the error has been sent to
+    /// or received by the peer.
+    ///
+    /// [`close()`]: struct.Connection.html#method.close
+    /// [`is_closed()`]: struct.Connection.html#method.is_closed
+    #[inline]
+    pub fn local_error(&self) -> Option<&ConnectionError> {
+        self.local_error.as_ref()
     }
 
     /// Collects and returns statistics about the connection.
@@ -4244,9 +4712,48 @@ impl Connection {
             recv: self.recv_count,
             sent: self.sent_count,
             lost: self.recovery.lost_count,
+            retrans: self.retrans_count,
             cwnd: self.recovery.cwnd(),
             rtt: self.recovery.rtt(),
+            sent_bytes: self.sent_bytes,
+            lost_bytes: self.recovery.bytes_lost,
+            recv_bytes: self.recv_bytes,
+            stream_retrans_bytes: self.stream_retrans_bytes,
+            pmtu: self.recovery.max_datagram_size(),
             delivery_rate: self.recovery.delivery_rate(),
+            peer_max_idle_timeout: self.peer_transport_params.max_idle_timeout,
+            peer_max_udp_payload_size: self
+                .peer_transport_params
+                .max_udp_payload_size,
+            peer_initial_max_data: self.peer_transport_params.initial_max_data,
+            peer_initial_max_stream_data_bidi_local: self
+                .peer_transport_params
+                .initial_max_stream_data_bidi_local,
+            peer_initial_max_stream_data_bidi_remote: self
+                .peer_transport_params
+                .initial_max_stream_data_bidi_remote,
+            peer_initial_max_stream_data_uni: self
+                .peer_transport_params
+                .initial_max_stream_data_uni,
+            peer_initial_max_streams_bidi: self
+                .peer_transport_params
+                .initial_max_streams_bidi,
+            peer_initial_max_streams_uni: self
+                .peer_transport_params
+                .initial_max_streams_uni,
+            peer_ack_delay_exponent: self
+                .peer_transport_params
+                .ack_delay_exponent,
+            peer_max_ack_delay: self.peer_transport_params.max_ack_delay,
+            peer_disable_active_migration: self
+                .peer_transport_params
+                .disable_active_migration,
+            peer_active_conn_id_limit: self
+                .peer_transport_params
+                .active_conn_id_limit,
+            peer_max_datagram_frame_size: self
+                .peer_transport_params
+                .max_datagram_frame_size,
         }
     }
 
@@ -4259,10 +4766,7 @@ impl Connection {
             &mut raw_params,
         )?;
 
-        self.handshake
-            .lock()
-            .unwrap()
-            .set_quic_transport_params(raw_params)?;
+        self.handshake.set_quic_transport_params(raw_params)?;
 
         Ok(())
     }
@@ -4336,10 +4840,7 @@ impl Connection {
         self.max_tx_data = peer_params.initial_max_data;
 
         // Update send capacity.
-        self.tx_cap = cmp::min(
-            self.recovery.cwnd_available() as u64,
-            self.max_tx_data - self.tx_data,
-        ) as usize;
+        self.update_tx_cap();
 
         self.streams
             .update_peer_max_streams_bidi(peer_params.initial_max_streams_bidi);
@@ -4359,14 +4860,27 @@ impl Connection {
     ///
     /// If the connection is already established, it does nothing.
     fn do_handshake(&mut self) -> Result<()> {
-        let handshake = self.handshake.lock().unwrap();
+        let mut ex_data = tls::ExData {
+            application_protos: &self.application_protos,
 
-        // Handshake is already complete, nothing more to do.
-        if handshake.is_completed() {
-            return Ok(());
+            pkt_num_spaces: &mut self.pkt_num_spaces,
+
+            session: &mut self.session,
+
+            local_error: &mut self.local_error,
+
+            keylog: self.keylog.as_mut(),
+
+            trace_id: &self.trace_id,
+
+            is_server: self.is_server,
+        };
+
+        if self.handshake_completed {
+            return self.handshake.process_post_handshake(&mut ex_data);
         }
 
-        match handshake.do_handshake() {
+        match self.handshake.do_handshake(&mut ex_data) {
             Ok(_) => (),
 
             Err(Error::Done) => {
@@ -4376,14 +4890,11 @@ impl Connection {
                 // This is potentially dangerous as the handshake hasn't been
                 // completed yet, though it's required to be able to send data
                 // in 0.5 RTT.
-                let raw_params = handshake.quic_transport_params();
+                let raw_params = self.handshake.quic_transport_params();
 
                 if !self.parsed_peer_transport_params && !raw_params.is_empty() {
                     let peer_params =
-                        TransportParams::decode(&raw_params, self.is_server)?;
-
-                    // Unlock handshake object.
-                    drop(handshake);
+                        TransportParams::decode(raw_params, self.is_server)?;
 
                     self.parse_peer_transport_params(peer_params)?;
                 }
@@ -4394,23 +4905,15 @@ impl Connection {
             Err(e) => return Err(e),
         };
 
-        self.handshake_completed = handshake.is_completed();
+        self.handshake_completed = self.handshake.is_completed();
 
-        self.alpn = handshake.alpn_protocol().to_vec();
+        self.alpn = self.handshake.alpn_protocol().to_vec();
 
-        let cipher = handshake.cipher();
-        let curve = handshake.curve();
-        let sigalg = handshake.sigalg();
-        let is_resumed = handshake.is_resumed();
-
-        let raw_params = handshake.quic_transport_params();
+        let raw_params = self.handshake.quic_transport_params();
 
         if !self.parsed_peer_transport_params && !raw_params.is_empty() {
             let peer_params =
-                TransportParams::decode(&raw_params, self.is_server)?;
-
-            // Unlock handshake object.
-            drop(handshake);
+                TransportParams::decode(raw_params, self.is_server)?;
 
             self.parse_peer_transport_params(peer_params)?;
         }
@@ -4422,8 +4925,13 @@ impl Connection {
         }
 
         trace!("{} connection established: proto={:?} cipher={:?} curve={:?} sigalg={:?} resumed={} {:?}",
-               &self.trace_id, std::str::from_utf8(self.application_proto()),
-               cipher, curve, sigalg, is_resumed, self.peer_transport_params);
+               &self.trace_id,
+               std::str::from_utf8(self.application_proto()),
+               self.handshake.cipher(),
+               self.handshake.curve(),
+               self.handshake.sigalg(),
+               self.handshake.is_resumed(),
+               self.peer_transport_params);
 
         Ok(())
     }
@@ -4437,7 +4945,7 @@ impl Connection {
             .as_ref()
             .map_or(false, |conn_err| !conn_err.is_app)
         {
-            let epoch = match self.handshake.lock().unwrap().write_level() {
+            let epoch = match self.handshake.write_level() {
                 crypto::Level::Initial => packet::EPOCH_INITIAL,
                 crypto::Level::ZeroRTT => unreachable!(),
                 crypto::Level::Handshake => packet::EPOCH_HANDSHAKE,
@@ -4478,7 +4986,7 @@ impl Connection {
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
         if (self.is_established() || self.is_in_early_data()) &&
-            ((self.is_server && !self.handshake_done_sent) ||
+            (self.should_send_handshake_done() ||
                 self.almost_full ||
                 self.blocked_limit.is_some() ||
                 self.dgram_send_queue.has_pending() ||
@@ -4493,7 +5001,8 @@ impl Connection {
                 self.streams.has_reset() ||
                 self.streams.has_stopped())
         {
-            if self.is_in_early_data() && !self.is_server {
+            // Only clients can send 0-RTT packets.
+            if !self.is_server && self.is_in_early_data() {
                 return Ok(packet::Type::ZeroRTT);
             }
 
@@ -4528,7 +5037,9 @@ impl Connection {
 
             frame::Frame::Ping => (),
 
-            frame::Frame::ACK { ranges, ack_delay } => {
+            frame::Frame::ACK {
+                ranges, ack_delay, ..
+            } => {
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
                         self.peer_transport_params.ack_delay_exponent as u32,
@@ -4545,6 +5056,10 @@ impl Connection {
                     self.peer_verified_address = true;
 
                     self.handshake_confirmed = true;
+                }
+
+                if self.delivery_rate_check_if_app_limited() {
+                    self.recovery.delivery_rate_update_app_limited(true);
                 }
 
                 self.recovery.on_ack_received(
@@ -4564,8 +5079,8 @@ impl Connection {
 
             frame::Frame::ResetStream {
                 stream_id,
+                error_code,
                 final_size,
-                ..
             } => {
                 // Peer can't send on our unidirectional streams.
                 if !stream::is_bidi(stream_id) &&
@@ -4573,6 +5088,8 @@ impl Connection {
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
+
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
@@ -4592,11 +5109,20 @@ impl Connection {
                     Err(e) => return Err(e),
                 };
 
-                self.rx_data += stream.recv.reset(final_size)? as u64;
+                let was_readable = stream.is_readable();
 
-                if self.rx_data > self.max_rx_data {
+                let max_off_delta =
+                    stream.recv.reset(error_code, final_size)? as u64;
+
+                if max_off_delta > max_rx_data_left {
                     return Err(Error::FlowControl);
                 }
+
+                if !was_readable && stream.is_readable() {
+                    self.streams.mark_readable(stream_id, true);
+                }
+
+                self.rx_data += max_off_delta;
             },
 
             frame::Frame::StopSending {
@@ -4631,7 +5157,15 @@ impl Connection {
                 let was_writable = stream.is_writable();
 
                 // Try stopping the stream.
-                if let Ok(final_size) = stream.send.stop(error_code) {
+                if let Ok((final_size, unsent)) = stream.send.stop(error_code) {
+                    // Claw back some flow control allowance from data that was
+                    // buffered but not actually sent before the stream was
+                    // reset.
+                    //
+                    // Note that `tx_cap` will be updated later on, so no need
+                    // to touch it here.
+                    self.tx_data = self.tx_data.saturating_sub(unsent);
+
                     self.streams
                         .mark_reset(stream_id, true, error_code, final_size);
 
@@ -4655,17 +5189,10 @@ impl Connection {
 
                 while let Ok((read, _)) = stream.recv.emit(&mut crypto_buf) {
                     let recv_buf = &crypto_buf[..read];
-                    self.handshake
-                        .lock()
-                        .unwrap()
-                        .provide_data(level, &recv_buf)?;
+                    self.handshake.provide_data(level, recv_buf)?;
                 }
 
-                if self.is_established() {
-                    self.handshake.lock().unwrap().process_post_handshake()?;
-                } else {
-                    self.do_handshake()?;
-                }
+                self.do_handshake()?;
             },
 
             frame::Frame::CryptoHeader { .. } => unreachable!(),
@@ -4681,7 +5208,7 @@ impl Connection {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
 
-                let max_rx_data_left = self.max_rx_data - self.rx_data;
+                let max_rx_data_left = self.max_rx_data() - self.rx_data;
 
                 // Get existing stream or create a new one, but if the stream
                 // has already been closed and collected, ignore the frame.
@@ -4709,9 +5236,11 @@ impl Connection {
                     return Err(Error::FlowControl);
                 }
 
+                let was_readable = stream.is_readable();
+
                 stream.recv.write(data)?;
 
-                if stream.is_readable() {
+                if !was_readable && stream.is_readable() {
                     self.streams.mark_readable(stream_id, true);
                 }
 
@@ -4858,8 +5387,10 @@ impl Connection {
                     self.dgram_recv_queue.pop();
                 }
 
-                self.dgram_recv_queue.push(&data)?;
+                self.dgram_recv_queue.push(data)?;
             },
+
+            frame::Frame::DatagramHeader { .. } => unreachable!(),
         }
 
         Ok(())
@@ -4889,8 +5420,22 @@ impl Connection {
     /// This happens when the new max data limit is at least double the amount
     /// of data that can be received before blocking.
     fn should_update_max_data(&self) -> bool {
-        self.max_rx_data_next != self.max_rx_data &&
-            self.max_rx_data_next / 2 > self.max_rx_data - self.rx_data
+        self.flow_control.should_update_max_data()
+    }
+
+    /// Returns the connection level flow control limit.
+    fn max_rx_data(&self) -> u64 {
+        self.flow_control.max_data()
+    }
+
+    /// Returns the updated connection level flow control limit.
+    fn max_rx_data_next(&self) -> u64 {
+        self.flow_control.max_data_next()
+    }
+
+    /// Returns true if the HANDSHAKE_DONE frame needs to be sent.
+    fn should_send_handshake_done(&self) -> bool {
+        self.is_established() && !self.handshake_done_sent && self.is_server
     }
 
     /// Returns the idle timeout value.
@@ -4936,6 +5481,36 @@ impl Connection {
             completed: self.is_established(),
         }
     }
+
+    /// Updates send capacity.
+    fn update_tx_cap(&mut self) {
+        self.tx_cap = cmp::min(
+            self.recovery.cwnd_available() as u64,
+            self.max_tx_data - self.tx_data,
+        ) as usize;
+    }
+
+    fn delivery_rate_check_if_app_limited(&self) -> bool {
+        // Enter the app-limited phase of delivery rate when these conditions
+        // are met:
+        //
+        // - The remaining capacity is higher than available bytes in cwnd (there
+        //   is more room to send).
+        // - New data since the last send() is smaller than available bytes in
+        //   cwnd (we queued less than what we can send).
+        // - There is room to send more data in cwnd.
+        //
+        // In application-limited phases the transmission rate is limited by the
+        // application rather than the congestion control algorithm.
+        //
+        // Note that this is equivalent to CheckIfApplicationLimited() from the
+        // delivery rate draft. This is also separate from `recovery.app_limited`
+        // and only applies to delivery rate calculation.
+        self.tx_cap >= self.recovery.cwnd_available() &&
+            (self.tx_data.saturating_sub(self.last_tx_data)) <
+                self.recovery.cwnd_available() as u64 &&
+            self.recovery.cwnd_available() > 0
+    }
 }
 
 /// Maps an `Error` to `Error::Done`, or itself.
@@ -4959,7 +5534,7 @@ impl Connection {
 fn drop_pkt_on_err(
     e: Error, recv_count: usize, is_server: bool, trace_id: &str,
 ) -> Error {
-    // On the server, if no other packet has been successflully processed, abort
+    // On the server, if no other packet has been successfully processed, abort
     // the connection to avoid keeping the connection open when only junk is
     // received.
     if is_server && recv_count == 0 {
@@ -4989,14 +5564,78 @@ pub struct Stats {
     /// The number of QUIC packets that were lost.
     pub lost: usize,
 
+    /// The number of sent QUIC packets with retransmitted data.
+    pub retrans: usize,
+
     /// The estimated round-trip time of the connection.
     pub rtt: time::Duration,
 
     /// The size of the connection's congestion window in bytes.
     pub cwnd: usize,
 
+    /// The number of sent bytes.
+    pub sent_bytes: u64,
+
+    /// The number of received bytes.
+    pub recv_bytes: u64,
+
+    /// The number of bytes lost.
+    pub lost_bytes: u64,
+
+    /// The number of stream bytes retransmitted.
+    pub stream_retrans_bytes: u64,
+
+    /// The current PMTU for the connection.
+    pub pmtu: usize,
+
     /// The most recent data delivery rate estimate in bytes/s.
+    ///
+    /// Note that this value could be inaccurate if the application does not
+    /// respect pacing hints (see [`SendInfo.at`] and [Pacing] for more
+    /// details).
+    ///
+    /// [`SendInfo.at`]: struct.SendInfo.html#structfield.at
+    /// [Pacing]: index.html#pacing
     pub delivery_rate: u64,
+
+    /// The maximum idle timeout.
+    pub peer_max_idle_timeout: u64,
+
+    /// The maximum UDP payload size.
+    pub peer_max_udp_payload_size: u64,
+
+    /// The initial flow control maximum data for the connection.
+    pub peer_initial_max_data: u64,
+
+    /// The initial flow control maximum data for local bidirectional streams.
+    pub peer_initial_max_stream_data_bidi_local: u64,
+
+    /// The initial flow control maximum data for remote bidirectional streams.
+    pub peer_initial_max_stream_data_bidi_remote: u64,
+
+    /// The initial flow control maximum data for unidirectional streams.
+    pub peer_initial_max_stream_data_uni: u64,
+
+    /// The initial maximum bidirectional streams.
+    pub peer_initial_max_streams_bidi: u64,
+
+    /// The initial maximum unidirectional streams.
+    pub peer_initial_max_streams_uni: u64,
+
+    /// The ACK delay exponent.
+    pub peer_ack_delay_exponent: u64,
+
+    /// The max ACK delay.
+    pub peer_max_ack_delay: u64,
+
+    /// Whether active migration is disabled.
+    pub peer_disable_active_migration: bool,
+
+    /// The active connection ID limit.
+    pub peer_active_conn_id_limit: u64,
+
+    /// DATAGRAM frame extension parameter, if any.
+    pub peer_max_datagram_frame_size: Option<u64>,
 }
 
 impl std::fmt::Debug for Stats {
@@ -5004,9 +5643,75 @@ impl std::fmt::Debug for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "recv={} sent={} lost={} rtt={:?} cwnd={}",
-            self.recv, self.sent, self.lost, self.rtt, self.cwnd,
-        )
+            "recv={} sent={} lost={} retrans={} rtt={:?} cwnd={}",
+            self.recv, self.sent, self.lost, self.retrans, self.rtt, self.cwnd,
+        )?;
+
+        write!(f, " peer_tps={{")?;
+
+        write!(f, " max_idle_timeout={},", self.peer_max_idle_timeout,)?;
+
+        write!(
+            f,
+            " max_udp_payload_size={},",
+            self.peer_max_udp_payload_size,
+        )?;
+
+        write!(f, " initial_max_data={},", self.peer_initial_max_data,)?;
+
+        write!(
+            f,
+            " initial_max_stream_data_bidi_local={},",
+            self.peer_initial_max_stream_data_bidi_local,
+        )?;
+
+        write!(
+            f,
+            " initial_max_stream_data_bidi_remote={},",
+            self.peer_initial_max_stream_data_bidi_remote,
+        )?;
+
+        write!(
+            f,
+            " initial_max_stream_data_uni={},",
+            self.peer_initial_max_stream_data_uni,
+        )?;
+
+        write!(
+            f,
+            " initial_max_streams_bidi={},",
+            self.peer_initial_max_streams_bidi,
+        )?;
+
+        write!(
+            f,
+            " initial_max_streams_uni={},",
+            self.peer_initial_max_streams_uni,
+        )?;
+
+        write!(f, " ack_delay_exponent={},", self.peer_ack_delay_exponent,)?;
+
+        write!(f, " max_ack_delay={},", self.peer_max_ack_delay,)?;
+
+        write!(
+            f,
+            " disable_active_migration={},",
+            self.peer_disable_active_migration,
+        )?;
+
+        write!(
+            f,
+            " active_conn_id_limit={},",
+            self.peer_active_conn_id_limit,
+        )?;
+
+        write!(
+            f,
+            " max_datagram_frame_size={:?}",
+            self.peer_max_datagram_frame_size,
+        )?;
+
+        write!(f, " }}")
     }
 }
 
@@ -5218,7 +5923,7 @@ impl TransportParams {
         if is_server {
             if let Some(ref odcid) = tp.original_destination_connection_id {
                 TransportParams::encode_param(&mut b, 0x0000, odcid.len())?;
-                b.put_bytes(&odcid)?;
+                b.put_bytes(odcid)?;
             }
         };
 
@@ -5234,7 +5939,7 @@ impl TransportParams {
         if is_server {
             if let Some(ref token) = tp.stateless_reset_token {
                 TransportParams::encode_param(&mut b, 0x0002, token.len())?;
-                b.put_bytes(&token)?;
+                b.put_bytes(token)?;
             }
         }
 
@@ -5336,13 +6041,13 @@ impl TransportParams {
 
         if let Some(scid) = &tp.initial_source_connection_id {
             TransportParams::encode_param(&mut b, 0x000f, scid.len())?;
-            b.put_bytes(&scid)?;
+            b.put_bytes(scid)?;
         }
 
         if is_server {
             if let Some(scid) = &tp.retry_source_connection_id {
                 TransportParams::encode_param(&mut b, 0x0010, scid.len())?;
-                b.put_bytes(&scid)?;
+                b.put_bytes(scid)?;
             }
         }
 
@@ -5363,37 +6068,56 @@ impl TransportParams {
     /// Creates a qlog event for connection transport parameters and TLS fields
     #[cfg(feature = "qlog")]
     pub fn to_qlog(
-        &self, owner: qlog::TransportOwner, version: u32, alpn: &[u8],
-        cipher: Option<crypto::Algorithm>,
-    ) -> qlog::event::Event {
-        let ocid = qlog::HexSlice::maybe_string(
+        &self, owner: TransportOwner, cipher: Option<crypto::Algorithm>,
+    ) -> EventData {
+        let original_destination_connection_id = qlog::HexSlice::maybe_string(
             self.original_destination_connection_id.as_ref(),
         );
-        let stateless_reset_token =
-            qlog::HexSlice::maybe_string(self.stateless_reset_token.as_ref());
 
-        qlog::event::Event::transport_parameters_set(
-            Some(owner),
-            None, // resumption
-            None, // early data
-            String::from_utf8(alpn.to_vec()).ok(),
-            Some(format!("{:x?}", version)),
-            Some(format!("{:?}", cipher)),
-            ocid,
-            stateless_reset_token,
-            Some(self.disable_active_migration),
-            Some(self.max_idle_timeout),
-            Some(self.max_udp_payload_size),
-            Some(self.ack_delay_exponent),
-            Some(self.max_ack_delay),
-            Some(self.active_conn_id_limit),
-            Some(self.initial_max_data.to_string()),
-            Some(self.initial_max_stream_data_bidi_local.to_string()),
-            Some(self.initial_max_stream_data_bidi_remote.to_string()),
-            Some(self.initial_max_stream_data_uni.to_string()),
-            Some(self.initial_max_streams_bidi.to_string()),
-            Some(self.initial_max_streams_uni.to_string()),
-            None, // preferred address
+        let stateless_reset_token = Some(qlog::Token {
+            ty: Some(qlog::TokenType::StatelessReset),
+            length: None,
+            data: qlog::HexSlice::maybe_string(
+                self.stateless_reset_token.as_ref(),
+            ),
+            details: None,
+        });
+
+        EventData::TransportParametersSet(
+            qlog::events::quic::TransportParametersSet {
+                owner: Some(owner),
+                resumption_allowed: None,
+                early_data_enabled: None,
+                tls_cipher: Some(format!("{:?}", cipher)),
+                aead_tag_length: None,
+                original_destination_connection_id,
+                initial_source_connection_id: None,
+                retry_source_connection_id: None,
+                stateless_reset_token,
+                disable_active_migration: Some(self.disable_active_migration),
+                max_idle_timeout: Some(self.max_idle_timeout),
+                max_udp_payload_size: Some(self.max_udp_payload_size as u32),
+                ack_delay_exponent: Some(self.ack_delay_exponent as u16),
+                max_ack_delay: Some(self.max_ack_delay as u16),
+                active_connection_id_limit: Some(
+                    self.active_conn_id_limit as u32,
+                ),
+
+                initial_max_data: Some(self.initial_max_data),
+                initial_max_stream_data_bidi_local: Some(
+                    self.initial_max_stream_data_bidi_local,
+                ),
+                initial_max_stream_data_bidi_remote: Some(
+                    self.initial_max_stream_data_bidi_remote,
+                ),
+                initial_max_stream_data_uni: Some(
+                    self.initial_max_stream_data_uni,
+                ),
+                initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
+                initial_max_streams_uni: Some(self.initial_max_streams_uni),
+
+                preferred_address: None,
+            },
         )
     }
 }
@@ -5403,8 +6127,8 @@ pub mod testing {
     use super::*;
 
     pub struct Pipe {
-        pub client: Pin<Box<Connection>>,
-        pub server: Pin<Box<Connection>>,
+        pub client: Connection,
+        pub server: Connection,
     }
 
     impl Pipe {
@@ -5421,7 +6145,7 @@ pub mod testing {
             config.set_initial_max_streams_uni(3);
             config.set_max_idle_timeout(180_000);
             config.verify_peer(false);
-            config.set_ack_delay_exponent(5);
+            config.set_ack_delay_exponent(8);
 
             Pipe::with_config(&mut config)
         }
@@ -5468,6 +6192,7 @@ pub mod testing {
             config.set_initial_max_stream_data_bidi_remote(15);
             config.set_initial_max_streams_bidi(3);
             config.set_initial_max_streams_uni(3);
+            config.set_ack_delay_exponent(8);
 
             Ok(Pipe {
                 client: connect(
@@ -5498,6 +6223,7 @@ pub mod testing {
             config.set_initial_max_stream_data_bidi_remote(15);
             config.set_initial_max_streams_bidi(3);
             config.set_initial_max_streams_uni(3);
+            config.set_ack_delay_exponent(8);
 
             Ok(Pipe {
                 client: connect(
@@ -5659,11 +6385,10 @@ pub mod testing {
 
         hdr.to_bytes(&mut b)?;
 
-        let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len()) +
-            space.crypto_overhead().unwrap();
+        let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
 
         if pkt_type != packet::Type::Short {
-            let len = pn_len + payload_len;
+            let len = pn_len + payload_len + space.crypto_overhead().unwrap();
             b.put_varint(len as u64)?;
         }
 
@@ -5688,6 +6413,7 @@ pub mod testing {
             pn_len,
             payload_len,
             payload_offset,
+            None,
             aead,
         )?;
 
@@ -5709,7 +6435,7 @@ pub mod testing {
 
         let payload_len = b.cap();
 
-        packet::decrypt_hdr(&mut b, &mut hdr, &aead).unwrap();
+        packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
 
         let pn = packet::decode_pkt_num(
             conn.pkt_num_spaces[epoch].largest_rx_pkt_num,
@@ -5918,6 +6644,8 @@ mod tests {
             pipe.client.application_proto(),
             pipe.server.application_proto()
         );
+
+        assert_eq!(pipe.server.server_name(), Some("quic.tech"));
     }
 
     #[test]
@@ -5926,11 +6654,7 @@ mod tests {
 
         // Disable session tickets on the server (SSL_OP_NO_TICKET) to avoid
         // triggering 1-RTT packet send with a CRYPTO frame.
-        pipe.server
-            .handshake
-            .lock()
-            .unwrap()
-            .set_options(0x0000_4000);
+        pipe.server.handshake.set_options(0x0000_4000);
 
         assert_eq!(pipe.handshake(), Ok(()));
 
@@ -6534,7 +7258,7 @@ mod tests {
         // Force server to send a single PING frame.
         pipe.server.recovery.loss_probes[packet::EPOCH_INITIAL] = 1;
 
-        // Artifically limit the amount of bytes the server can send.
+        // Artificially limit the amount of bytes the server can send.
         pipe.server.max_send_bytes = 60;
 
         assert_eq!(pipe.server.send(&mut buf), Err(Error::Done));
@@ -6647,7 +7371,7 @@ mod tests {
                 max: 30
             })
         );
-        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 46 }));
+        assert_eq!(iter.next(), Some(&frame::Frame::MaxData { max: 61 }));
     }
 
     #[test]
@@ -6731,7 +7455,7 @@ mod tests {
 
         let frames = [frame::Frame::Stream {
             stream_id: 4,
-            data: stream::RangeBuf::from(b"aaaaaaa", 0, false),
+            data: stream::RangeBuf::from(b"aaaaaaaaa", 0, false),
         }];
 
         let pkt_type = packet::Type::Short;
@@ -6742,7 +7466,7 @@ mod tests {
 
         let frames = [frame::Frame::Stream {
             stream_id: 4,
-            data: stream::RangeBuf::from(b"a", 7, false),
+            data: stream::RangeBuf::from(b"a", 9, false),
         }];
 
         let len = pipe
@@ -6762,7 +7486,7 @@ mod tests {
             iter.next(),
             Some(&frame::Frame::MaxStreamData {
                 stream_id: 4,
-                max: 22,
+                max: 24,
             })
         );
     }
@@ -7066,6 +7790,136 @@ mod tests {
     }
 
     #[test]
+    /// Tests that receiving a valid RESET_STREAM frame when all data has
+    /// already been read, notifies the application.
+    fn reset_stream_data_recvd() {
+        let mut b = [0; 15];
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client sends some data.
+        assert_eq!(pipe.client.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server gets data and sends data back, closing stream.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((5, false)));
+        assert!(!pipe.server.stream_finished(4));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.server.stream_send(4, b"", true), Ok(0));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.client.stream_recv(4, &mut b), Ok((0, true)));
+        assert!(pipe.client.stream_finished(4));
+
+        // Client sends RESET_STREAM, closing stream.
+        let frames = [frame::Frame::ResetStream {
+            stream_id: 4,
+            error_code: 42,
+            final_size: 5,
+        }];
+
+        let pkt_type = packet::Type::Short;
+        assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
+
+        // Server is notified of stream readability, due to reset.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(
+            pipe.server.stream_recv(4, &mut b),
+            Err(Error::StreamReset(42))
+        );
+
+        assert!(pipe.server.stream_finished(4));
+
+        // Sending RESET_STREAM again shouldn't make stream readable again.
+        assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), None);
+    }
+
+    #[test]
+    /// Tests that receiving a valid RESET_STREAM frame when all data has _not_
+    /// been read, discards all buffered data and notifies the application.
+    fn reset_stream_data_not_recvd() {
+        let mut b = [0; 15];
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client sends some data.
+        assert_eq!(pipe.client.stream_send(4, b"h", false), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server gets data and sends data back, closing stream.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((1, false)));
+        assert!(!pipe.server.stream_finished(4));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.server.stream_send(4, b"", true), Ok(0));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(pipe.client.stream_recv(4, &mut b), Ok((0, true)));
+        assert!(pipe.client.stream_finished(4));
+
+        // Client sends RESET_STREAM, closing stream.
+        let frames = [frame::Frame::ResetStream {
+            stream_id: 4,
+            error_code: 42,
+            final_size: 5,
+        }];
+
+        let pkt_type = packet::Type::Short;
+        assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
+
+        // Server is notified of stream readability, due to reset.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(
+            pipe.server.stream_recv(4, &mut b),
+            Err(Error::StreamReset(42))
+        );
+
+        assert!(pipe.server.stream_finished(4));
+
+        // Sending RESET_STREAM again shouldn't make stream readable again.
+        assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(39));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), None);
+    }
+
+    #[test]
+    /// Tests that RESET_STREAM frames exceeding the connection-level flow
+    /// control limit cause an error.
     fn reset_stream_flow_control() {
         let mut buf = [0; 65535];
 
@@ -7100,15 +7954,41 @@ mod tests {
     }
 
     #[test]
+    /// Tests that RESET_STREAM frames exceeding the stream-level flow control
+    /// limit cause an error.
+    fn reset_stream_flow_control_stream() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        let frames = [
+            frame::Frame::Stream {
+                stream_id: 4,
+                data: stream::RangeBuf::from(b"a", 0, false),
+            },
+            frame::Frame::ResetStream {
+                stream_id: 4,
+                error_code: 0,
+                final_size: 16, // Past stream's flow control limit.
+            },
+        ];
+
+        let pkt_type = packet::Type::Short;
+        assert_eq!(
+            pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
+            Err(Error::FlowControl),
+        );
+    }
+
+    #[test]
     fn path_challenge() {
         let mut buf = [0; 65535];
 
         let mut pipe = testing::Pipe::default().unwrap();
         assert_eq!(pipe.handshake(), Ok(()));
 
-        let frames = [frame::Frame::PathChallenge {
-            data: vec![0xba; 8],
-        }];
+        let frames = [frame::Frame::PathChallenge { data: [0xba; 8] }];
 
         let pkt_type = packet::Type::Short;
 
@@ -7127,9 +8007,7 @@ mod tests {
 
         assert_eq!(
             iter.next(),
-            Some(&frame::Frame::PathResponse {
-                data: vec![0xba; 8],
-            })
+            Some(&frame::Frame::PathResponse { data: [0xba; 8] })
         );
     }
 
@@ -7239,7 +8117,7 @@ mod tests {
         assert_eq!(r.next(), None);
 
         loop {
-            if pipe.server.stream_send(4, b"world", false) == Ok(0) {
+            if pipe.server.stream_send(4, b"world", false) == Err(Error::Done) {
                 break;
             }
 
@@ -7297,6 +8175,7 @@ mod tests {
         let frames = [frame::Frame::ACK {
             ack_delay: 15,
             ranges,
+            ecn_counts: None,
         }];
 
         assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(0));
@@ -7353,11 +8232,15 @@ mod tests {
         let mut r = pipe.server.readable();
         assert_eq!(r.next(), None);
 
-        // Server sends data, and closes stream.
+        // Server sends data...
         let mut r = pipe.server.writable();
         assert_eq!(r.next(), Some(4));
         assert_eq!(r.next(), None);
 
+        assert_eq!(pipe.server.stream_send(4, b"world", false), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // ...and buffers more, and closes stream.
         assert_eq!(pipe.server.stream_send(4, b"world", true), Ok(5));
 
         // Client sends STOP_SENDING before server flushes stream.
@@ -7391,6 +8274,82 @@ mod tests {
 
         // No more frames are sent by the server.
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    /// Tests that resetting a stream restores flow control for unsent data.
+    fn stop_sending_unsent_tx_cap() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.set_initial_max_data(15);
+        config.set_initial_max_stream_data_bidi_local(30);
+        config.set_initial_max_stream_data_bidi_remote(30);
+        config.set_initial_max_stream_data_uni(30);
+        config.set_initial_max_streams_bidi(3);
+        config.set_initial_max_streams_uni(0);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client sends some data.
+        assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 15];
+        assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((5, true)));
+
+        // Server sends some data.
+        assert_eq!(pipe.server.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server buffers some data, until send capacity limit reached.
+        assert_eq!(pipe.server.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(pipe.server.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(
+            pipe.server.stream_send(4, b"hello", false),
+            Err(Error::Done)
+        );
+        assert_eq!(
+            pipe.server.stream_send(8, b"hello", false),
+            Err(Error::Done)
+        );
+
+        // Client sends STOP_SENDING.
+        let frames = [frame::Frame::StopSending {
+            stream_id: 4,
+            error_code: 42,
+        }];
+
+        let pkt_type = packet::Type::Short;
+        pipe.send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
+
+        // Server can now send more data (on a different stream).
+        assert_eq!(pipe.client.stream_send(8, b"hello", true), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(8, b"hello", false), Ok(5));
+        assert_eq!(pipe.server.stream_send(8, b"hello", false), Ok(5));
+        assert_eq!(
+            pipe.server.stream_send(8, b"hello", false),
+            Err(Error::Done)
+        );
+        assert_eq!(pipe.advance(), Ok(()));
     }
 
     #[test]
@@ -7544,6 +8503,7 @@ mod tests {
 
         // Server sends some data.
         assert_eq!(pipe.server.stream_send(4, b"goodbye, world", false), Ok(14));
+        assert_eq!(pipe.advance(), Ok(()));
 
         // Server shuts down stream.
         assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Write, 42), Ok(()));
@@ -7589,14 +8549,95 @@ mod tests {
 
         assert_eq!(pipe.server.stream_recv(4, &mut buf), Ok((15, true)));
 
+        // Client processes readable streams.
+        let mut r = pipe.client.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        assert_eq!(
+            pipe.client.stream_recv(4, &mut buf),
+            Err(Error::StreamReset(42))
+        );
+
         // Stream is collected on both sides.
-        // TODO: assert_eq!(pipe.client.streams.len(), 0);
+        assert_eq!(pipe.client.streams.len(), 0);
         assert_eq!(pipe.server.streams.len(), 0);
 
         assert_eq!(
             pipe.server.stream_shutdown(4, Shutdown::Write, 0),
             Err(Error::Done)
         );
+    }
+
+    #[test]
+    /// Tests that shutting down a stream restores flow control for unsent data.
+    fn stream_shutdown_write_unsent_tx_cap() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.set_initial_max_data(15);
+        config.set_initial_max_stream_data_bidi_local(30);
+        config.set_initial_max_stream_data_bidi_remote(30);
+        config.set_initial_max_stream_data_uni(30);
+        config.set_initial_max_streams_bidi(3);
+        config.set_initial_max_streams_uni(0);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client sends some data.
+        assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(4));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 15];
+        assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((5, true)));
+
+        // Server sends some data.
+        assert_eq!(pipe.server.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server buffers some data, until send capacity limit reached.
+        assert_eq!(pipe.server.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(pipe.server.stream_send(4, b"hello", false), Ok(5));
+        assert_eq!(
+            pipe.server.stream_send(4, b"hello", false),
+            Err(Error::Done)
+        );
+        assert_eq!(
+            pipe.server.stream_send(8, b"hello", false),
+            Err(Error::Done)
+        );
+
+        // Client shouldn't update flow control.
+        assert_eq!(pipe.client.should_update_max_data(), false);
+
+        // Server shuts down stream.
+        assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Write, 42), Ok(()));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server can now send more data (on a different stream).
+        assert_eq!(pipe.client.stream_send(8, b"hello", true), Ok(5));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.server.stream_send(8, b"hello", false), Ok(5));
+        assert_eq!(pipe.server.stream_send(8, b"hello", false), Ok(5));
+        assert_eq!(
+            pipe.server.stream_send(8, b"hello", false),
+            Err(Error::Done)
+        );
+        assert_eq!(pipe.advance(), Ok(()));
     }
 
     #[test]
@@ -7772,7 +8813,7 @@ mod tests {
         assert_eq!(w.next(), Some(4));
         assert_eq!(w.next(), None);
 
-        // Server suts down stream.
+        // Server shuts down stream.
         assert_eq!(pipe.server.stream_shutdown(4, Shutdown::Write, 0), Ok(()));
 
         let mut w = pipe.server.writable();
@@ -7819,7 +8860,7 @@ mod tests {
             Ok(15)
         );
         assert_eq!(pipe.advance(), Ok(()));
-        assert_eq!(pipe.client.stream_send(8, b"a", false), Ok(0));
+        assert_eq!(pipe.client.stream_send(8, b"a", false), Err(Error::Done));
         assert_eq!(pipe.advance(), Ok(()));
 
         let mut r = pipe.server.readable();
@@ -7945,8 +8986,7 @@ mod tests {
         let space = &mut pipe.client.pkt_num_spaces[epoch];
 
         // Use correct payload length when encrypting the packet.
-        let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len()) +
-            space.crypto_overhead().unwrap();
+        let payload_len = frames.iter().fold(0, |acc, x| acc + x.wire_len());
 
         let aead = space.crypto_seal.as_ref().unwrap();
 
@@ -7956,6 +8996,7 @@ mod tests {
             pn_len,
             payload_len,
             payload_offset,
+            None,
             aead,
         )
         .unwrap();
@@ -8088,7 +9129,7 @@ mod tests {
     }
 
     #[test]
-    /// Tests that the MAX_STREAMS frame is sent for unirectional streams.
+    /// Tests that the MAX_STREAMS frame is sent for unidirectional streams.
     fn stream_limit_update_uni() {
         let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
         config
@@ -8253,6 +9294,25 @@ mod tests {
         // Stream is completed and _is not_ readable.
         let mut r = pipe.client.readable();
         assert_eq!(r.next(), None);
+    }
+
+    #[test]
+    /// Tests that the stream gets created with stream_send() even if there's
+    /// no data in the buffer and the fin flag is not set.
+    fn stream_zero_length_non_fin() {
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"", false), Ok(0));
+
+        // The stream now should have been created.
+        assert_eq!(pipe.client.streams.len(), 1);
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Sending an empty non-fin should not change any stream state on the
+        // other side.
+        let mut r = pipe.server.readable();
+        assert!(r.next().is_none());
     }
 
     #[test]
@@ -8645,9 +9705,57 @@ mod tests {
 
         assert_eq!(iter.next(), None);
 
-        // Send again from blocked stream and make sure it is marked as blocked
-        // again.
-        assert_eq!(pipe.client.stream_send(0, b"aaaaaa", false), Ok(0));
+        // Send again from blocked stream and make sure it is not marked as
+        // blocked again.
+        assert_eq!(
+            pipe.client.stream_send(0, b"aaaaaa", false),
+            Err(Error::Done)
+        );
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+    }
+
+    #[test]
+    fn stream_data_blocked_unblocked_flow_control() {
+        let mut buf = [0; 65535];
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(
+            pipe.client.stream_send(0, b"aaaaaaaaaaaaaaah", false),
+            Ok(15)
+        );
+        assert_eq!(pipe.client.streams.blocked().len(), 1);
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+
+        // Send again on blocked stream. It's blocked at the same offset as
+        // previously, so it should not be marked as blocked again.
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+
+        // No matter how many times we try to write stream data tried, no
+        // packets containing STREAM_BLOCKED should be emitted.
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+
+        assert_eq!(pipe.client.stream_send(0, b"h", false), Err(Error::Done));
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
+
+        // Now read some data at the server to release flow control.
+        let mut r = pipe.server.readable();
+        assert_eq!(r.next(), Some(0));
+        assert_eq!(r.next(), None);
+
+        let mut b = [0; 10];
+        assert_eq!(pipe.server.stream_recv(0, &mut b), Ok((10, false)));
+        assert_eq!(&b[..10], b"aaaaaaaaaa");
+        assert_eq!(pipe.advance(), Ok(()));
+
+        assert_eq!(pipe.client.stream_send(0, b"hhhhhhhhhh!", false), Ok(10));
         assert_eq!(pipe.client.streams.blocked().len(), 1);
 
         let (len, _) = pipe.client.send(&mut buf).unwrap();
@@ -8662,13 +9770,15 @@ mod tests {
             iter.next(),
             Some(&frame::Frame::StreamDataBlocked {
                 stream_id: 0,
-                limit: 15,
+                limit: 25,
             })
         );
 
-        assert_eq!(iter.next(), Some(&frame::Frame::Padding { len: 1 }));
+        // don't care about remaining received frames
 
-        assert_eq!(iter.next(), None);
+        assert_eq!(pipe.client.stream_send(0, b"!", false), Err(Error::Done));
+        assert_eq!(pipe.client.streams.blocked().len(), 0);
+        assert_eq!(pipe.client.send(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -9416,6 +10526,7 @@ mod tests {
                 data: stream::RangeBuf::from(b"b", 0, false),
             })
         );
+        assert_eq!(pipe.client.stats().retrans, 1);
     }
 
     #[test]
@@ -10076,6 +11187,25 @@ mod tests {
     }
 
     #[test]
+    fn local_error() {
+        let mut pipe = testing::Pipe::default().unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        assert_eq!(pipe.server.local_error(), None);
+
+        assert_eq!(pipe.server.close(true, 0x1234, b"hello!"), Ok(()));
+
+        assert_eq!(
+            pipe.server.local_error(),
+            Some(&ConnectionError {
+                is_app: true,
+                error_code: 0x1234u64,
+                reason: b"hello!".to_vec()
+            })
+        );
+    }
+
+    #[test]
     fn update_max_datagram_size() {
         let mut client_scid = [0; 16];
         rand::rand_bytes(&mut client_scid[..]);
@@ -10189,10 +11319,139 @@ mod tests {
         assert_eq!(pipe.server.stream_send(8, &buf[..5000], false), Ok(2000));
 
         // No more connection send capacity.
-        assert_eq!(pipe.server.stream_send(12, &buf[..5000], false), Ok(0));
+        assert_eq!(
+            pipe.server.stream_send(12, &buf[..5000], false),
+            Err(Error::Done)
+        );
         assert_eq!(pipe.server.tx_cap, 0);
 
         assert_eq!(pipe.advance(), Ok(()));
+    }
+
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[test]
+    fn user_provided_boring_ctx() -> Result<()> {
+        // Manually construct boring ssl ctx for server
+        let server_tls_ctx = {
+            let mut builder = boring::ssl::SslContextBuilder::new(
+                boring::ssl::SslMethod::tls(),
+            )
+            .unwrap();
+            builder
+                .set_certificate_chain_file("examples/cert.crt")
+                .unwrap();
+            builder
+                .set_private_key_file(
+                    "examples/cert.key",
+                    boring::ssl::SslFiletype::PEM,
+                )
+                .unwrap();
+            builder.build()
+        };
+
+        let mut server_config =
+            Config::with_boring_ssl_ctx(crate::PROTOCOL_VERSION, server_tls_ctx)?;
+        let mut client_config = Config::new(crate::PROTOCOL_VERSION)?;
+        client_config.load_cert_chain_from_pem_file("examples/cert.crt")?;
+        client_config.load_priv_key_from_pem_file("examples/cert.key")?;
+
+        for config in [&mut client_config, &mut server_config] {
+            config.set_application_protos(b"\x06proto1\x06proto2")?;
+            config.set_initial_max_data(30);
+            config.set_initial_max_stream_data_bidi_local(15);
+            config.set_initial_max_stream_data_bidi_remote(15);
+            config.set_initial_max_stream_data_uni(10);
+            config.set_initial_max_streams_bidi(3);
+            config.set_initial_max_streams_uni(3);
+            config.set_max_idle_timeout(180_000);
+            config.verify_peer(false);
+            config.set_ack_delay_exponent(8);
+        }
+
+        let mut client_scid = [0; 16];
+        rand::rand_bytes(&mut client_scid[..]);
+        let client_scid = ConnectionId::from_ref(&client_scid);
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+
+        let mut server_scid = [0; 16];
+        rand::rand_bytes(&mut server_scid[..]);
+        let server_scid = ConnectionId::from_ref(&server_scid);
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+
+        let mut pipe = testing::Pipe {
+            client: connect(
+                Some("quic.tech"),
+                &client_scid,
+                client_addr,
+                &mut client_config,
+            )?,
+            server: accept(&server_scid, None, server_addr, &mut server_config)?,
+        };
+
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        Ok(())
+    }
+
+    #[test]
+    /// Tests that resetting a stream restores flow control for unsent data.
+    fn last_tx_data_larger_than_tx_data() {
+        let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+        config
+            .set_application_protos(b"\x06proto1\x06proto2")
+            .unwrap();
+        config.set_initial_max_data(12000);
+        config.set_initial_max_stream_data_bidi_local(20000);
+        config.set_initial_max_stream_data_bidi_remote(20000);
+        config.set_max_recv_udp_payload_size(1200);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_client_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Client opens stream 4 and 8.
+        assert_eq!(pipe.client.stream_send(4, b"a", true), Ok(1));
+        assert_eq!(pipe.client.stream_send(8, b"b", true), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+
+        // Server reads stream data.
+        let mut b = [0; 15];
+        pipe.server.stream_recv(4, &mut b).unwrap();
+
+        // Server sends stream data close to cwnd (12000).
+        let buf = [0; 10000];
+        assert_eq!(pipe.server.stream_send(4, &buf, false), Ok(10000));
+
+        testing::emit_flight(&mut pipe.server).unwrap();
+
+        // Server buffers some data, until send capacity limit reached.
+        let mut buf = [0; 1200];
+        assert_eq!(pipe.server.stream_send(4, &buf, false), Ok(1200));
+        assert_eq!(pipe.server.stream_send(8, &buf, false), Ok(800));
+        assert_eq!(pipe.server.stream_send(4, &buf, false), Err(Error::Done));
+
+        // Wait for PTO to expire.
+        let timer = pipe.server.timeout().unwrap();
+        std::thread::sleep(timer + time::Duration::from_millis(1));
+
+        pipe.server.on_timeout();
+
+        // Server sends PTO probe (not limited to cwnd),
+        // to update last_tx_data.
+        let (len, _) = pipe.server.send(&mut buf).unwrap();
+        assert_eq!(len, 1200);
+
+        // Client sends STOP_SENDING to decrease tx_data
+        // by unsent data. It will make last_tx_data > tx_data
+        // and trigger #1232 bug.
+        let frames = [frame::Frame::StopSending {
+            stream_id: 4,
+            error_code: 42,
+        }];
+
+        let pkt_type = packet::Type::Short;
+        pipe.send_pkt_to_server(pkt_type, &frames, &mut buf)
+            .unwrap();
     }
 }
 
@@ -10208,10 +11467,10 @@ mod crypto;
 mod dgram;
 #[cfg(feature = "ffi")]
 mod ffi;
+mod flowcontrol;
 mod frame;
 pub mod h3;
 mod minmax;
-mod octets;
 mod packet;
 mod rand;
 mod ranges;
