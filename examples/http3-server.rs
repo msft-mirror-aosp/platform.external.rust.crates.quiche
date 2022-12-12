@@ -46,7 +46,7 @@ struct PartialResponse {
 }
 
 struct Client {
-    conn: std::pin::Pin<Box<quiche::Connection>>,
+    conn: quiche::Connection,
 
     http3_conn: Option<quiche::h3::Connection>,
 
@@ -70,20 +70,15 @@ fn main() {
     }
 
     // Setup the event loop.
-    let poll = mio::Poll::new().unwrap();
+    let mut poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
     // Create the UDP listening socket, and register it with the event loop.
-    let socket = net::UdpSocket::bind("127.0.0.1:4433").unwrap();
-
-    let socket = mio::net::UdpSocket::from_socket(socket).unwrap();
-    poll.register(
-        &socket,
-        mio::Token(0),
-        mio::Ready::readable(),
-        mio::PollOpt::edge(),
-    )
-    .unwrap();
+    let mut socket =
+        mio::net::UdpSocket::bind("127.0.0.1:4433".parse().unwrap()).unwrap();
+    poll.registry()
+        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
+        .unwrap();
 
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
@@ -198,7 +193,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, &from) {
+                    if let Err(e) = socket.send_to(out, from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send() would block");
                             break;
@@ -235,7 +230,7 @@ fn main() {
 
                     let out = &out[..len];
 
-                    if let Err(e) = socket.send_to(out, &from) {
+                    if let Err(e) = socket.send_to(out, from) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             debug!("send() would block");
                             break;
@@ -360,7 +355,14 @@ fn main() {
 
                         Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
+                        Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
+
                         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
+
+                        Ok((
+                            _prioritized_element_id,
+                            quiche::h3::Event::PriorityUpdate,
+                        )) => (),
 
                         Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
@@ -403,7 +405,7 @@ fn main() {
                     },
                 };
 
-                if let Err(e) = socket.send_to(&out[..write], &send_info.to) {
+                if let Err(e) = socket.send_to(&out[..write], send_info.to) {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("send() would block");
                         break;
@@ -500,7 +502,7 @@ fn handle_request(
     info!(
         "{} got request {:?} on stream id {}",
         conn.trace_id(),
-        headers,
+        hdrs_to_strings(headers),
         stream_id
     );
 
@@ -620,7 +622,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     let resp = client.partial_responses.get_mut(&stream_id).unwrap();
 
     if let Some(ref headers) = resp.headers {
-        match http3_conn.send_response(conn, stream_id, &headers, false) {
+        match http3_conn.send_response(conn, stream_id, headers, false) {
             Ok(_) => (),
 
             Err(quiche::h3::Error::StreamBlocked) => {
@@ -656,4 +658,15 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     if resp.written == resp.body.len() {
         client.partial_responses.remove(&stream_id);
     }
+}
+
+fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
+    hdrs.iter()
+        .map(|h| {
+            (
+                String::from_utf8(h.name().into()).unwrap(),
+                String::from_utf8(h.value().into()).unwrap(),
+            )
+        })
+        .collect()
 }
