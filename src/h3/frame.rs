@@ -26,7 +26,8 @@
 
 use super::Result;
 
-use crate::octets;
+#[cfg(feature = "qlog")]
+use qlog::events::h3::Http3Frame;
 
 pub const DATA_FRAME_TYPE_ID: u64 = 0x0;
 pub const HEADERS_FRAME_TYPE_ID: u64 = 0x1;
@@ -35,11 +36,13 @@ pub const SETTINGS_FRAME_TYPE_ID: u64 = 0x4;
 pub const PUSH_PROMISE_FRAME_TYPE_ID: u64 = 0x5;
 pub const GOAWAY_FRAME_TYPE_ID: u64 = 0x6;
 pub const MAX_PUSH_FRAME_TYPE_ID: u64 = 0xD;
+pub const PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID: u64 = 0xF0700;
+pub const PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID: u64 = 0xF0701;
 
-const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
-const SETTINGS_MAX_HEADER_LIST_SIZE: u64 = 0x6;
-const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
-const SETTINGS_H3_DATAGRAM: u64 = 0x276;
+pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
+pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x6;
+pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
+pub const SETTINGS_H3_DATAGRAM: u64 = 0x276;
 
 // Permit between 16 maximally-encoded and 128 minimally-encoded SETTINGS.
 const MAX_SETTINGS_PAYLOAD_SIZE: usize = 256;
@@ -59,11 +62,12 @@ pub enum Frame {
     },
 
     Settings {
-        max_header_list_size: Option<u64>,
+        max_field_section_size: Option<u64>,
         qpack_max_table_capacity: Option<u64>,
         qpack_blocked_streams: Option<u64>,
         h3_datagram: Option<u64>,
         grease: Option<(u64, u64)>,
+        raw: Option<Vec<(u64, u64)>>,
     },
 
     PushPromise {
@@ -79,7 +83,20 @@ pub enum Frame {
         push_id: u64,
     },
 
-    Unknown,
+    PriorityUpdateRequest {
+        prioritized_element_id: u64,
+        priority_field_value: Vec<u8>,
+    },
+
+    PriorityUpdatePush {
+        prioritized_element_id: u64,
+        priority_field_value: Vec<u8>,
+    },
+
+    Unknown {
+        raw_type: u64,
+        payload_length: u64,
+    },
 }
 
 impl Frame {
@@ -116,7 +133,14 @@ impl Frame {
                 push_id: b.get_varint()?,
             },
 
-            _ => Frame::Unknown,
+            PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID |
+            PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID =>
+                parse_priority_update(frame_type, payload_length, &mut b)?,
+
+            _ => Frame::Unknown {
+                raw_type: frame_type,
+                payload_length,
+            },
         };
 
         Ok(frame)
@@ -148,16 +172,17 @@ impl Frame {
             },
 
             Frame::Settings {
-                max_header_list_size,
+                max_field_section_size,
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
                 h3_datagram,
                 grease,
+                ..
             } => {
                 let mut len = 0;
 
-                if let Some(val) = max_header_list_size {
-                    len += octets::varint_len(SETTINGS_MAX_HEADER_LIST_SIZE);
+                if let Some(val) = max_field_section_size {
+                    len += octets::varint_len(SETTINGS_MAX_FIELD_SECTION_SIZE);
                     len += octets::varint_len(*val);
                 }
 
@@ -184,8 +209,8 @@ impl Frame {
                 b.put_varint(SETTINGS_FRAME_TYPE_ID)?;
                 b.put_varint(len as u64)?;
 
-                if let Some(val) = max_header_list_size {
-                    b.put_varint(SETTINGS_MAX_HEADER_LIST_SIZE)?;
+                if let Some(val) = max_field_section_size {
+                    b.put_varint(SETTINGS_MAX_FIELD_SECTION_SIZE)?;
                     b.put_varint(*val as u64)?;
                 }
 
@@ -236,22 +261,161 @@ impl Frame {
                 b.put_varint(*push_id)?;
             },
 
-            Frame::Unknown => unreachable!(),
+            Frame::PriorityUpdateRequest {
+                prioritized_element_id,
+                priority_field_value,
+            } => {
+                let len = octets::varint_len(*prioritized_element_id) +
+                    priority_field_value.len();
+
+                b.put_varint(PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID)?;
+                b.put_varint(len as u64)?;
+
+                b.put_varint(*prioritized_element_id as u64)?;
+                b.put_bytes(priority_field_value)?;
+            },
+
+            Frame::PriorityUpdatePush {
+                prioritized_element_id,
+                priority_field_value,
+            } => {
+                let len = octets::varint_len(*prioritized_element_id) +
+                    priority_field_value.len();
+
+                b.put_varint(PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID)?;
+                b.put_varint(len as u64)?;
+
+                b.put_varint(*prioritized_element_id as u64)?;
+                b.put_bytes(priority_field_value)?;
+            },
+
+            Frame::Unknown { .. } => unreachable!(),
         }
 
         Ok(before - b.cap())
+    }
+
+    #[cfg(feature = "qlog")]
+    pub fn to_qlog(&self) -> Http3Frame {
+        match self {
+            Frame::Data { .. } => Http3Frame::Data { raw: None },
+
+            // Qlog expects the `headers` to be represented as an array of
+            // name:value pairs. At this stage, we only have the qpack block, so
+            // populate the field with an empty vec.
+            Frame::Headers { .. } => Http3Frame::Headers { headers: vec![] },
+
+            Frame::CancelPush { push_id } =>
+                Http3Frame::CancelPush { push_id: *push_id },
+
+            Frame::Settings {
+                max_field_section_size,
+                qpack_max_table_capacity,
+                qpack_blocked_streams,
+                h3_datagram,
+                grease,
+                ..
+            } => {
+                let mut settings = vec![];
+
+                if let Some(v) = max_field_section_size {
+                    settings.push(qlog::events::h3::Setting {
+                        name: "MAX_FIELD_SECTION_SIZE".to_string(),
+                        value: *v,
+                    });
+                }
+
+                if let Some(v) = qpack_max_table_capacity {
+                    settings.push(qlog::events::h3::Setting {
+                        name: "QPACK_MAX_TABLE_CAPACITY".to_string(),
+                        value: *v,
+                    });
+                }
+
+                if let Some(v) = qpack_blocked_streams {
+                    settings.push(qlog::events::h3::Setting {
+                        name: "QPACK_BLOCKED_STREAMS".to_string(),
+                        value: *v,
+                    });
+                }
+
+                if let Some(v) = h3_datagram {
+                    settings.push(qlog::events::h3::Setting {
+                        name: "H3_DATAGRAM".to_string(),
+                        value: *v,
+                    });
+                }
+
+                if let Some((k, v)) = grease {
+                    settings.push(qlog::events::h3::Setting {
+                        name: k.to_string(),
+                        value: *v,
+                    });
+                }
+
+                qlog::events::h3::Http3Frame::Settings { settings }
+            },
+
+            // Qlog expects the `headers` to be represented as an array of
+            // name:value pairs. At this stage, we only have the qpack block, so
+            // populate the field with an empty vec.
+            Frame::PushPromise { push_id, .. } => Http3Frame::PushPromise {
+                push_id: *push_id,
+                headers: vec![],
+            },
+
+            Frame::GoAway { id } => Http3Frame::Goaway { id: *id },
+
+            Frame::MaxPushId { push_id } =>
+                Http3Frame::MaxPushId { push_id: *push_id },
+
+            Frame::PriorityUpdateRequest {
+                prioritized_element_id,
+                priority_field_value,
+            } => Http3Frame::PriorityUpdate {
+                target_stream_type:
+                    qlog::events::h3::H3PriorityTargetStreamType::Request,
+                prioritized_element_id: *prioritized_element_id,
+                priority_field_value: String::from_utf8_lossy(
+                    priority_field_value,
+                )
+                .into_owned(),
+            },
+
+            Frame::PriorityUpdatePush {
+                prioritized_element_id,
+                priority_field_value,
+            } => Http3Frame::PriorityUpdate {
+                target_stream_type:
+                    qlog::events::h3::H3PriorityTargetStreamType::Request,
+                prioritized_element_id: *prioritized_element_id,
+                priority_field_value: String::from_utf8_lossy(
+                    priority_field_value,
+                )
+                .into_owned(),
+            },
+
+            Frame::Unknown {
+                raw_type,
+                payload_length,
+            } => Http3Frame::Unknown {
+                raw_frame_type: *raw_type,
+                raw_length: Some(*payload_length as u32),
+                raw: None,
+            },
+        }
     }
 }
 
 impl std::fmt::Debug for Frame {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Frame::Data { payload } => {
-                write!(f, "DATA len={}", payload.len())?;
+            Frame::Data { .. } => {
+                write!(f, "DATA")?;
             },
 
-            Frame::Headers { header_block } => {
-                write!(f, "HEADERS len={}", header_block.len())?;
+            Frame::Headers { .. } => {
+                write!(f, "HEADERS")?;
             },
 
             Frame::CancelPush { push_id } => {
@@ -259,12 +423,13 @@ impl std::fmt::Debug for Frame {
             },
 
             Frame::Settings {
-                max_header_list_size,
+                max_field_section_size,
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
+                raw,
                 ..
             } => {
-                write!(f, "SETTINGS max_headers={:?}, qpack_max_table={:?}, qpack_blocked={:?} ", max_header_list_size, qpack_max_table_capacity, qpack_blocked_streams)?;
+                write!(f, "SETTINGS max_field_section={:?}, qpack_max_table={:?}, qpack_blocked={:?} raw={:?}", max_field_section_size, qpack_max_table_capacity, qpack_blocked_streams, raw)?;
             },
 
             Frame::PushPromise {
@@ -287,8 +452,32 @@ impl std::fmt::Debug for Frame {
                 write!(f, "MAX_PUSH_ID push_id={}", push_id)?;
             },
 
-            Frame::Unknown => {
-                write!(f, "UNKNOWN")?;
+            Frame::PriorityUpdateRequest {
+                prioritized_element_id,
+                priority_field_value,
+            } => {
+                write!(
+                    f,
+                    "PRIORITY_UPDATE request_stream_id={}, priority_field_len={}",
+                    prioritized_element_id,
+                    priority_field_value.len()
+                )?;
+            },
+
+            Frame::PriorityUpdatePush {
+                prioritized_element_id,
+                priority_field_value,
+            } => {
+                write!(
+                    f,
+                    "PRIORITY_UPDATE push_id={}, priority_field_len={}",
+                    prioritized_element_id,
+                    priority_field_value.len()
+                )?;
+            },
+
+            Frame::Unknown { raw_type, .. } => {
+                write!(f, "UNKNOWN raw_type={}", raw_type,)?;
             },
         }
 
@@ -299,10 +488,11 @@ impl std::fmt::Debug for Frame {
 fn parse_settings_frame(
     b: &mut octets::Octets, settings_length: usize,
 ) -> Result<Frame> {
-    let mut max_header_list_size = None;
+    let mut max_field_section_size = None;
     let mut qpack_max_table_capacity = None;
     let mut qpack_blocked_streams = None;
     let mut h3_datagram = None;
+    let mut raw = Vec::new();
 
     // Reject SETTINGS frames that are too long.
     if settings_length > MAX_SETTINGS_PAYLOAD_SIZE {
@@ -310,28 +500,32 @@ fn parse_settings_frame(
     }
 
     while b.off() < settings_length {
-        let setting_ty = b.get_varint()?;
-        let settings_val = b.get_varint()?;
+        let identifier = b.get_varint()?;
+        let value = b.get_varint()?;
 
-        match setting_ty {
+        // MAX_SETTINGS_PAYLOAD_SIZE protects us from storing too many raw
+        // settings.
+        raw.push((identifier, value));
+
+        match identifier {
             SETTINGS_QPACK_MAX_TABLE_CAPACITY => {
-                qpack_max_table_capacity = Some(settings_val);
+                qpack_max_table_capacity = Some(value);
             },
 
-            SETTINGS_MAX_HEADER_LIST_SIZE => {
-                max_header_list_size = Some(settings_val);
+            SETTINGS_MAX_FIELD_SECTION_SIZE => {
+                max_field_section_size = Some(value);
             },
 
             SETTINGS_QPACK_BLOCKED_STREAMS => {
-                qpack_blocked_streams = Some(settings_val);
+                qpack_blocked_streams = Some(value);
             },
 
             SETTINGS_H3_DATAGRAM => {
-                if settings_val > 1 {
+                if value > 1 {
                     return Err(super::Error::SettingsError);
                 }
 
-                h3_datagram = Some(settings_val);
+                h3_datagram = Some(value);
             },
 
             // Reserved values overlap with HTTP/2 and MUST be rejected
@@ -344,11 +538,12 @@ fn parse_settings_frame(
     }
 
     Ok(Frame::Settings {
-        max_header_list_size,
+        max_field_section_size,
         qpack_max_table_capacity,
         qpack_blocked_streams,
         h3_datagram,
         grease: None,
+        raw: Some(raw),
     })
 }
 
@@ -363,6 +558,31 @@ fn parse_push_promise(
         push_id,
         header_block,
     })
+}
+
+fn parse_priority_update(
+    frame_type: u64, payload_length: u64, b: &mut octets::Octets,
+) -> Result<Frame> {
+    let prioritized_element_id = b.get_varint()?;
+    let priority_field_value_length =
+        payload_length - octets::varint_len(prioritized_element_id) as u64;
+    let priority_field_value =
+        b.get_bytes(priority_field_value_length as usize)?.to_vec();
+
+    match frame_type {
+        PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID =>
+            Ok(Frame::PriorityUpdateRequest {
+                prioritized_element_id,
+                priority_field_value,
+            }),
+
+        PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID => Ok(Frame::PriorityUpdatePush {
+            prioritized_element_id,
+            priority_field_value,
+        }),
+
+        _ => unreachable!(),
+    }
 }
 
 #[cfg(test)]
@@ -456,12 +676,20 @@ mod tests {
     fn settings_all_no_grease() {
         let mut d = [42; 128];
 
+        let raw_settings = vec![
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            (SETTINGS_H3_DATAGRAM, 0),
+        ];
+
         let frame = Frame::Settings {
-            max_header_list_size: Some(0),
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: Some(0),
             grease: None,
+            raw: Some(raw_settings),
         };
 
         let frame_payload_len = 9;
@@ -490,20 +718,31 @@ mod tests {
         let mut d = [42; 128];
 
         let frame = Frame::Settings {
-            max_header_list_size: Some(0),
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: Some(0),
             grease: Some((33, 33)),
+            raw: Default::default(),
         };
 
-        // Frame parsing will always ignore GREASE values.
+        let raw_settings = vec![
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            (SETTINGS_H3_DATAGRAM, 0),
+            (33, 33),
+        ];
+
+        // Frame parsing will not populate GREASE property but will be in the
+        // raw info.
         let frame_parsed = Frame::Settings {
-            max_header_list_size: Some(0),
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: Some(0),
             grease: None,
+            raw: Some(raw_settings),
         };
 
         let frame_payload_len = 11;
@@ -531,12 +770,15 @@ mod tests {
     fn settings_h3_only() {
         let mut d = [42; 128];
 
+        let raw_settings = vec![(SETTINGS_MAX_FIELD_SECTION_SIZE, 1024)];
+
         let frame = Frame::Settings {
-            max_header_list_size: Some(1024),
+            max_field_section_size: Some(1024),
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             h3_datagram: None,
             grease: None,
+            raw: Some(raw_settings),
         };
 
         let frame_payload_len = 3;
@@ -564,12 +806,15 @@ mod tests {
     fn settings_h3_dgram_only() {
         let mut d = [42; 128];
 
+        let raw_settings = vec![(SETTINGS_H3_DATAGRAM, 1)];
+
         let frame = Frame::Settings {
-            max_header_list_size: None,
+            max_field_section_size: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             h3_datagram: Some(1),
             grease: None,
+            raw: Some(raw_settings),
         };
 
         let frame_payload_len = 3;
@@ -598,11 +843,12 @@ mod tests {
         let mut d = [42; 128];
 
         let frame = Frame::Settings {
-            max_header_list_size: None,
+            max_field_section_size: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             h3_datagram: Some(5),
             grease: None,
+            raw: Default::default(),
         };
 
         let frame_payload_len = 3;
@@ -629,12 +875,18 @@ mod tests {
     fn settings_qpack_only() {
         let mut d = [42; 128];
 
+        let raw_settings = vec![
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+        ];
+
         let frame = Frame::Settings {
-            max_header_list_size: None,
+            max_field_section_size: None,
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
             grease: None,
+            raw: Some(raw_settings),
         };
 
         let frame_payload_len = 4;
@@ -837,9 +1089,79 @@ mod tests {
     }
 
     #[test]
+    fn priority_update_request() {
+        let mut d = [42; 128];
+
+        let prioritized_element_id = 4;
+        let priority_field_value = b"abcdefghijklm".to_vec();
+        let frame_payload_len = 1 + priority_field_value.len();
+        let frame_header_len = 5;
+
+        let frame = Frame::PriorityUpdateRequest {
+            prioritized_element_id,
+            priority_field_value,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, frame_header_len + frame_payload_len);
+
+        assert_eq!(
+            Frame::from_bytes(
+                PRIORITY_UPDATE_FRAME_REQUEST_TYPE_ID,
+                frame_payload_len as u64,
+                &d[frame_header_len..]
+            )
+            .unwrap(),
+            frame
+        );
+    }
+
+    #[test]
+    fn priority_update_push() {
+        let mut d = [42; 128];
+
+        let prioritized_element_id = 6;
+        let priority_field_value = b"abcdefghijklm".to_vec();
+        let frame_payload_len = 1 + priority_field_value.len();
+        let frame_header_len = 5;
+
+        let frame = Frame::PriorityUpdatePush {
+            prioritized_element_id,
+            priority_field_value,
+        };
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, frame_header_len + frame_payload_len);
+
+        assert_eq!(
+            Frame::from_bytes(
+                PRIORITY_UPDATE_FRAME_PUSH_TYPE_ID,
+                frame_payload_len as u64,
+                &d[frame_header_len..]
+            )
+            .unwrap(),
+            frame
+        );
+    }
+
+    #[test]
     fn unknown_type() {
         let d = [42; 12];
 
-        assert_eq!(Frame::from_bytes(255, 12345, &d[..]), Ok(Frame::Unknown));
+        assert_eq!(
+            Frame::from_bytes(255, 12345, &d[..]),
+            Ok(Frame::Unknown {
+                raw_type: 255,
+                payload_length: 12345
+            })
+        );
     }
 }
