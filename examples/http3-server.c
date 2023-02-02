@@ -205,7 +205,7 @@ static struct conn_io *create_conn(uint8_t *scid, size_t scid_len,
     conn_io->sock = conns->sock;
     conn_io->conn = conn;
 
-    memcpy(&conn_io->peer_addr, &peer_addr, peer_addr_len);
+    memcpy(&conn_io->peer_addr, peer_addr, peer_addr_len);
     conn_io->peer_addr_len = peer_addr_len;
 
     ev_init(&conn_io->timer, timeout_cb);
@@ -440,6 +440,12 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
                     }
 
                     case QUICHE_H3_EVENT_FINISHED:
+                        break;
+
+                    case QUICHE_H3_EVENT_RESET:
+                        break;
+
+                    case QUICHE_H3_EVENT_PRIORITY_UPDATE:
                         break;
 
                     case QUICHE_H3_EVENT_DATAGRAM:
