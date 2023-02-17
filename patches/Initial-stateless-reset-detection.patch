@@ -1,0 +1,91 @@
+From 2c1ce8948b8fe1a11ea57ff8d1bcee07d038f49e Mon Sep 17 00:00:00 2001
+From: Mike Yu <yumike@google.com>
+Date: Wed, 1 Feb 2023 06:14:18 +0000
+Subject: [PATCH] Initial stateless reset detection
+
+Backport the stateless reset patch to AOSP (current
+version of quiche is 0.14.0) so that we don't need to
+wait until the patch is released to a quiche version
+newer than 0.16.0 (currently, the latest version is 0.16.0).
+
+This patch is slightly modified because the type of
+stateless_reset_token is different (In 0.14.0 the
+type is Option<Vec<u8>>; in 0.16.0 the type is
+Option<u128>).
+
+Source patch:
+https://github.com/cloudflare/quiche/commit/c6357db0b5311010e266637eda2f645b7fa91df4.
+
+Bug: 242832641
+Bug: 245074765
+Bug: 258767218
+Test: cd packages/modules/DnsResolver && atest
+Test: cd external/rust/crates/quiche && atest
+Test: 1. Applied ag/20124672 to DnsResolver
+      2. Ran dnschk every 5 minutes for 1 hour
+      3. Checked the log:
+        a. Confirmed that some stateless reset packets were received
+        b. Confirmed that DNS queries fallback'ed to DoT immediately
+           after DnsResolver received stateless reset packets
+Change-Id: Ife933f54ac6ec1098a9046673ca200c6b4e2ebbf
+---
+ src/lib.rs | 36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 2e13278..d590979 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1864,7 +1864,17 @@ impl Connection {
+             let read = match self.recv_single(&mut buf[len - left..len], &info) {
+                 Ok(v) => v,
+ 
+-                Err(Error::Done) => left,
++                Err(Error::Done) => {
++                    // If the packet can't be processed or decrypted, check if
++                    // it's a stateless reset.
++                    if self.is_stateless_reset(&buf[len - left..len]) {
++                        trace!("{} packet is a stateless reset", self.trace_id);
++
++                        self.closed = true;
++                    }
++
++                    left
++                },
+ 
+                 Err(e) => {
+                     // In case of error processing the incoming packet, close
+@@ -1900,6 +1910,30 @@ impl Connection {
+         Ok(done)
+     }
+ 
++    /// Returns true if a QUIC packet is a stateless reset.
++    fn is_stateless_reset(&self, buf: &[u8]) -> bool {
++        // If the packet is too small, then we just throw it away.
++        let buf_len = buf.len();
++        if buf_len < 21 {
++            return false;
++        }
++
++        // TODO: we should iterate over all active destination connection IDs
++        // and check against their reset token.
++        match &self.peer_transport_params.stateless_reset_token {
++            Some(token) => {
++                let token_len = 16;
++                ring::constant_time::verify_slices_are_equal(
++                    &token,
++                    &buf[buf_len - token_len..buf_len],
++                )
++                .is_ok()
++            },
++
++            None => false,
++        }
++    }
++
+     /// Processes a single QUIC packet received from the peer.
+     ///
+     /// On success the number of bytes processed from the input buffer is
+-- 
+2.39.1.456.gfc5497dd1b-goog
+
