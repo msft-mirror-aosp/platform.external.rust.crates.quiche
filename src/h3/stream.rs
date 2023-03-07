@@ -27,8 +27,6 @@
 use super::Error;
 use super::Result;
 
-use crate::octets;
-
 use super::frame;
 
 pub const HTTP3_CONTROL_STREAM_TYPE_ID: u64 = 0x0;
@@ -46,6 +44,20 @@ pub enum Type {
     QpackEncoder,
     QpackDecoder,
     Unknown,
+}
+
+impl Type {
+    #[cfg(feature = "qlog")]
+    pub fn to_qlog(self) -> qlog::events::h3::H3StreamType {
+        match self {
+            Type::Control => qlog::events::h3::H3StreamType::Control,
+            Type::Request => qlog::events::h3::H3StreamType::Data,
+            Type::Push => qlog::events::h3::H3StreamType::Push,
+            Type::QpackEncoder => qlog::events::h3::H3StreamType::QpackEncode,
+            Type::QpackDecoder => qlog::events::h3::H3StreamType::QpackDecode,
+            Type::Unknown => qlog::events::h3::H3StreamType::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,6 +153,9 @@ pub struct Stream {
 
     /// Whether a `Data` event has been triggered for this stream.
     data_event_triggered: bool,
+
+    /// The last `PRIORITY_UPDATE` frame encoded field value, if any.
+    last_priority_update: Option<Vec<u8>>,
 }
 
 impl Stream {
@@ -179,6 +194,8 @@ impl Stream {
             local_initialized: false,
 
             data_event_triggered: false,
+
+            last_priority_update: None,
         }
     }
 
@@ -327,6 +344,11 @@ impl Stream {
         Ok(())
     }
 
+    // Returns the stream's current frame type, if any
+    pub fn frame_type(&self) -> Option<u64> {
+        self.frame_type
+    }
+
     /// Sets the frame's payload length and transitions to the next state.
     pub fn set_frame_payload_len(&mut self, len: u64) -> Result<()> {
         assert_eq!(self.state, State::FramePayloadLen);
@@ -441,20 +463,24 @@ impl Stream {
     }
 
     /// Tries to parse a frame from the state buffer.
-    pub fn try_consume_frame(&mut self) -> Result<frame::Frame> {
+    ///
+    /// If successful, returns the `frame::Frame` and the payload length.
+    pub fn try_consume_frame(&mut self) -> Result<(frame::Frame, u64)> {
         // Processing a frame other than DATA, so re-arm the Data event.
         self.reset_data_event();
+
+        let payload_len = self.state_len as u64;
 
         // TODO: properly propagate frame parsing errors.
         let frame = frame::Frame::from_bytes(
             self.frame_type.unwrap(),
-            self.state_len as u64,
+            payload_len,
             &self.state_buf,
         )?;
 
         self.state_transition(State::FrameType, 1, true)?;
 
-        Ok(frame)
+        Ok((frame, payload_len))
     }
 
     /// Tries to read DATA payload from the transport stream.
@@ -535,6 +561,21 @@ impl Stream {
         self.data_event_triggered = false;
     }
 
+    /// Set the last priority update for the stream.
+    pub fn set_last_priority_update(&mut self, priority_update: Option<Vec<u8>>) {
+        self.last_priority_update = priority_update;
+    }
+
+    /// Take the last priority update and leave `None` in its place.
+    pub fn take_last_priority_update(&mut self) -> Option<Vec<u8>> {
+        self.last_priority_update.take()
+    }
+
+    /// Returns `true` if there is a priority update.
+    pub fn has_last_priority_update(&self) -> bool {
+        self.last_priority_update.is_some()
+    }
+
     /// Returns true if the state buffer has enough data to complete the state.
     fn state_buffer_complete(&self) -> bool {
         self.state_off == self.state_len
@@ -545,22 +586,22 @@ impl Stream {
     fn state_transition(
         &mut self, new_state: State, expected_len: usize, resize: bool,
     ) -> Result<()> {
-        self.state = new_state;
-        self.state_off = 0;
-        self.state_len = expected_len;
-
         // Some states don't need the state buffer, so don't resize it if not
         // necessary.
         if resize {
             // A peer can influence the size of the state buffer (e.g. with the
             // payload size of a GREASE frame), so we need to limit the maximum
             // size to avoid DoS.
-            if self.state_len > MAX_STATE_BUF_SIZE {
-                return Err(Error::InternalError);
+            if expected_len > MAX_STATE_BUF_SIZE {
+                return Err(Error::ExcessiveLoad);
             }
 
-            self.state_buf.resize(self.state_len, 0);
+            self.state_buf.resize(expected_len, 0);
         }
+
+        self.state = new_state;
+        self.state_off = 0;
+        self.state_len = expected_len;
 
         Ok(())
     }
@@ -568,6 +609,8 @@ impl Stream {
 
 #[cfg(test)]
 mod tests {
+    use crate::h3::frame::*;
+
     use super::*;
 
     #[test]
@@ -579,12 +622,19 @@ mod tests {
         let mut d = vec![42; 40];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        let frame = frame::Frame::Settings {
-            max_header_list_size: Some(0),
+        let raw_settings = vec![
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+        ];
+
+        let frame = Frame::Settings {
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
             grease: None,
+            raw: Some(raw_settings),
         };
 
         b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
@@ -622,7 +672,7 @@ mod tests {
         // Parse the SETTINGS frame payload.
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
-        assert_eq!(stream.try_consume_frame(), Ok(frame));
+        assert_eq!(stream.try_consume_frame(), Ok((frame, 6)));
         assert_eq!(stream.state, State::FrameType);
     }
 
@@ -635,12 +685,19 @@ mod tests {
         let mut d = vec![42; 40];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
+        let raw_settings = vec![
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+        ];
+
         let frame = frame::Frame::Settings {
-            max_header_list_size: Some(0),
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
             grease: None,
+            raw: Some(raw_settings),
         };
 
         b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
@@ -679,7 +736,7 @@ mod tests {
         // Parse the SETTINGS frame payload.
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
-        assert_eq!(stream.try_consume_frame(), Ok(frame));
+        assert_eq!(stream.try_consume_frame(), Ok((frame, 6)));
         assert_eq!(stream.state, State::FrameType);
 
         // Parse the second SETTINGS frame type.
@@ -700,12 +757,19 @@ mod tests {
 
         let goaway = frame::Frame::GoAway { id: 0 };
 
+        let raw_settings = vec![
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+        ];
+
         let settings = frame::Frame::Settings {
-            max_header_list_size: Some(0),
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
             grease: None,
+            raw: Some(raw_settings),
         };
 
         b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
@@ -743,12 +807,20 @@ mod tests {
         let header_block = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let hdrs = frame::Frame::Headers { header_block };
 
+        let raw_settings = vec![
+            (SETTINGS_MAX_FIELD_SECTION_SIZE, 0),
+            (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
+            (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+            (33, 33),
+        ];
+
         let settings = frame::Frame::Settings {
-            max_header_list_size: Some(0),
+            max_field_section_size: Some(0),
             qpack_max_table_capacity: Some(0),
             qpack_blocked_streams: Some(0),
             h3_datagram: None,
             grease: None,
+            raw: Some(raw_settings),
         };
 
         b.put_varint(HTTP3_CONTROL_STREAM_TYPE_ID).unwrap();
@@ -837,7 +909,7 @@ mod tests {
         // Parse the HEADERS frame.
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
-        assert_eq!(stream.try_consume_frame(), Ok(hdrs));
+        assert_eq!(stream.try_consume_frame(), Ok((hdrs, 12)));
         assert_eq!(stream.state, State::FrameType);
 
         // Parse the DATA frame type.
@@ -930,7 +1002,7 @@ mod tests {
         // Parse the HEADERS frame.
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
-        assert_eq!(stream.try_consume_frame(), Ok(hdrs));
+        assert_eq!(stream.try_consume_frame(), Ok((hdrs, 12)));
         assert_eq!(stream.state, State::FrameType);
 
         // Parse the DATA frame type.
