@@ -39,17 +39,29 @@ use crate::recovery::CongestionControlOps;
 use crate::recovery::Recovery;
 
 pub static RENO: CongestionControlOps = CongestionControlOps {
+    on_init,
     on_packet_sent,
-    on_packet_acked,
+    on_packets_acked,
     congestion_event,
     collapse_cwnd,
     checkpoint,
     rollback,
     has_custom_pacing,
+    debug_fmt,
 };
+
+pub fn on_init(_r: &mut Recovery) {}
 
 pub fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, _now: Instant) {
     r.bytes_in_flight += sent_bytes;
+}
+
+fn on_packets_acked(
+    r: &mut Recovery, packets: &[Acked], epoch: packet::Epoch, now: Instant,
+) {
+    for pkt in packets {
+        on_packet_acked(r, pkt, epoch, now);
+    }
 }
 
 fn on_packet_acked(
@@ -70,53 +82,30 @@ fn on_packet_acked(
         // acknowledged bytes.
         r.bytes_acked_sl += packet.size;
 
-        if r.bytes_acked_sl >= r.max_datagram_size {
+        if r.hystart.in_css(epoch) {
+            r.congestion_window += r.hystart.css_cwnd_inc(r.max_datagram_size);
+        } else {
             r.congestion_window += r.max_datagram_size;
-            r.bytes_acked_sl -= r.max_datagram_size;
         }
 
-        if r.hystart.enabled() &&
-            epoch == packet::EPOCH_APPLICATION &&
-            r.hystart.try_enter_lss(
-                packet,
-                r.latest_rtt,
-                r.congestion_window,
-                now,
-                r.max_datagram_size,
-            )
-        {
+        if r.hystart.on_packet_acked(epoch, packet, r.latest_rtt, now) {
+            // Exit to congestion avoidance if CSS ends.
             r.ssthresh = r.congestion_window;
         }
     } else {
         // Congestion avoidance.
-        let mut reno_cwnd = r.congestion_window;
-
         r.bytes_acked_ca += packet.size;
 
         if r.bytes_acked_ca >= r.congestion_window {
             r.bytes_acked_ca -= r.congestion_window;
-            reno_cwnd += r.max_datagram_size;
-        }
-
-        // When in Limited Slow Start, take the max of CA cwnd and
-        // LSS cwnd.
-        if r.hystart.in_lss(epoch) {
-            let lss_cwnd_inc = r.hystart.lss_cwnd_inc(
-                packet.size,
-                r.congestion_window,
-                r.ssthresh,
-            );
-
-            r.congestion_window =
-                cmp::max(reno_cwnd, r.congestion_window + lss_cwnd_inc);
-        } else {
-            r.congestion_window = reno_cwnd;
+            r.congestion_window += r.max_datagram_size;
         }
     }
 }
 
 fn congestion_event(
-    r: &mut Recovery, time_sent: Instant, epoch: packet::Epoch, now: Instant,
+    r: &mut Recovery, _lost_bytes: usize, time_sent: Instant,
+    epoch: packet::Epoch, now: Instant,
 ) {
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.
@@ -137,7 +126,7 @@ fn congestion_event(
 
         r.ssthresh = r.congestion_window;
 
-        if r.hystart.in_lss(epoch) {
+        if r.hystart.in_css(epoch) {
             r.hystart.congestion_event();
         }
     }
@@ -147,14 +136,24 @@ pub fn collapse_cwnd(r: &mut Recovery) {
     r.congestion_window = r.max_datagram_size * recovery::MINIMUM_WINDOW_PACKETS;
     r.bytes_acked_sl = 0;
     r.bytes_acked_ca = 0;
+
+    if r.hystart.enabled() {
+        r.hystart.reset();
+    }
 }
 
 fn checkpoint(_r: &mut Recovery) {}
 
-fn rollback(_r: &mut Recovery) {}
+fn rollback(_r: &mut Recovery) -> bool {
+    true
+}
 
 fn has_custom_pacing() -> bool {
     false
+}
+
+fn debug_fmt(_r: &Recovery, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -208,7 +207,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: std::time::Instant::now(),
-            recent_delivered_packet_sent_time: std::time::Instant::now(),
+            first_sent_time: std::time::Instant::now(),
             is_app_limited: false,
             has_data: false,
         };
@@ -224,6 +223,11 @@ mod tests {
             pkt_num: p.pkt_num,
             time_sent: p.time_sent,
             size: p.size,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
         }];
 
         r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
@@ -252,7 +256,7 @@ mod tests {
             in_flight: true,
             delivered: 0,
             delivered_time: std::time::Instant::now(),
-            recent_delivered_packet_sent_time: std::time::Instant::now(),
+            first_sent_time: std::time::Instant::now(),
             is_app_limited: false,
             has_data: false,
         };
@@ -269,16 +273,31 @@ mod tests {
                 pkt_num: p.pkt_num,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             },
             Acked {
                 pkt_num: p.pkt_num,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             },
             Acked {
                 pkt_num: p.pkt_num,
                 time_sent: p.time_sent,
                 size: p.size,
+                delivered: 0,
+                delivered_time: now,
+                first_sent_time: now,
+                is_app_limited: false,
+                rtt: Duration::ZERO,
             },
         ];
 
@@ -299,7 +318,12 @@ mod tests {
 
         let now = Instant::now();
 
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // In Reno, after congestion event, cwnd will be cut in half.
         assert_eq!(prev_cwnd / 2, r.cwnd());
@@ -318,7 +342,12 @@ mod tests {
         r.on_packet_sent_cc(20000, now);
 
         // Trigger congestion event to update ssthresh
-        r.congestion_event(now, packet::EPOCH_APPLICATION, now);
+        r.congestion_event(
+            r.max_datagram_size,
+            now,
+            packet::EPOCH_APPLICATION,
+            now,
+        );
 
         // After congestion event, cwnd will be reduced.
         let cur_cwnd =
@@ -333,6 +362,11 @@ mod tests {
             time_sent: now + rtt,
             // More than cur_cwnd to increase cwnd
             size: 8000,
+            delivered: 0,
+            delivered_time: now,
+            first_sent_time: now,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
         }];
 
         // Ack more than cwnd bytes with rtt=100ms
