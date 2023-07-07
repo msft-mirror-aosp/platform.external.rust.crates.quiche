@@ -63,6 +63,8 @@ rust_defaults {
         "liblog_rust",
         "liboctets",
         "libring",
+        "libslab",
+        "libsmallvec",
     ],
     prefer_rlib: true,
     // For DnsResolver (Mainline module introduced in Q).
@@ -132,6 +134,8 @@ rust_defaults {
         "libmio",
         "liboctets",
         "libring",
+        "libslab",
+        "libsmallvec",
         "liburl",
     ],
     data: [
