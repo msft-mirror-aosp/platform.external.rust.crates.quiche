@@ -40,6 +40,7 @@ use crate::recovery::Recovery;
 
 pub static RENO: CongestionControlOps = CongestionControlOps {
     on_init,
+    reset,
     on_packet_sent,
     on_packets_acked,
     congestion_event,
@@ -51,6 +52,8 @@ pub static RENO: CongestionControlOps = CongestionControlOps {
 };
 
 pub fn on_init(_r: &mut Recovery) {}
+
+pub fn reset(_r: &mut Recovery) {}
 
 pub fn on_packet_sent(r: &mut Recovery, sent_bytes: usize, _now: Instant) {
     r.bytes_in_flight += sent_bytes;
@@ -160,6 +163,7 @@ fn debug_fmt(_r: &Recovery, _f: &mut std::fmt::Formatter) -> std::fmt::Result {
 mod tests {
     use super::*;
 
+    use smallvec::smallvec;
     use std::time::Duration;
 
     #[test]
@@ -198,7 +202,7 @@ mod tests {
 
         let p = recovery::Sent {
             pkt_num: 0,
-            frames: vec![],
+            frames: smallvec![],
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -230,7 +234,7 @@ mod tests {
             rtt: Duration::ZERO,
         }];
 
-        r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
+        r.on_packets_acked(acked, packet::Epoch::Application, now);
 
         // Check if cwnd increased by packet size (slow start).
         assert_eq!(r.cwnd(), cwnd_prev + p.size);
@@ -247,7 +251,7 @@ mod tests {
 
         let p = recovery::Sent {
             pkt_num: 0,
-            frames: vec![],
+            frames: smallvec![],
             time_sent: now,
             time_acked: None,
             time_lost: None,
@@ -301,7 +305,7 @@ mod tests {
             },
         ];
 
-        r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now);
+        r.on_packets_acked(acked, packet::Epoch::Application, now);
 
         // Acked 3 packets.
         assert_eq!(r.cwnd(), cwnd_prev + p.size * 3);
@@ -321,7 +325,7 @@ mod tests {
         r.congestion_event(
             r.max_datagram_size,
             now,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             now,
         );
 
@@ -345,7 +349,7 @@ mod tests {
         r.congestion_event(
             r.max_datagram_size,
             now,
-            packet::EPOCH_APPLICATION,
+            packet::Epoch::Application,
             now,
         );
 
@@ -371,7 +375,7 @@ mod tests {
 
         // Ack more than cwnd bytes with rtt=100ms
         r.update_rtt(rtt, Duration::from_millis(0), now);
-        r.on_packets_acked(acked, packet::EPOCH_APPLICATION, now + rtt * 2);
+        r.on_packets_acked(acked, packet::Epoch::Application, now + rtt * 2);
 
         // After acking more than cwnd, expect cwnd increased by MSS
         assert_eq!(r.cwnd(), cur_cwnd + r.max_datagram_size);
