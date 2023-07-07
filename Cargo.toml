@@ -11,8 +11,9 @@
 
 [package]
 edition = "2018"
+rust-version = "1.66"
 name = "quiche"
-version = "0.14.0"
+version = "0.17.1"
 authors = ["Alessandro Ghedini <alessandro@ghedini.me>"]
 build = "src/build.rs"
 include = [
@@ -80,10 +81,10 @@ version = "0.4"
 features = ["std"]
 
 [dependencies.octets]
-version = "0.1"
+version = "0.2"
 
 [dependencies.qlog]
-version = "0.7"
+version = "0.9"
 optional = true
 
 [dependencies.ring]
@@ -92,6 +93,16 @@ version = "0.16"
 [dependencies.sfv]
 version = "0.9"
 optional = true
+
+[dependencies.slab]
+version = "0.4"
+
+[dependencies.smallvec]
+version = "1.10"
+features = [
+    "serde",
+    "union",
+]
 
 [dev-dependencies.mio]
 version = "0.8"
@@ -123,4 +134,5 @@ features = [
     "wincrypt",
     "ws2def",
     "ws2ipdef",
+    "ws2tcpip",
 ]
