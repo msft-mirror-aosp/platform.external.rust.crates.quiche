@@ -1,10 +1,17 @@
 diff --git a/Android.bp b/Android.bp
-index a810b69..ec19374 100644
+index a1a223b..1b4784b 100644
 --- a/Android.bp
 +++ b/Android.bp
-@@ -51,11 +51,7 @@ rust_library {
+@@ -46,70 +46,64 @@ cc_library_headers {
+ }
+ 
+ rust_library {
+     name: "libquiche",
+     host_supported: true,
+     crate_name: "quiche",
+     cargo_env_compat: true,
      cargo_pkg_version: "0.17.1",
-     srcs: ["src/lib.rs"],
+     crate_root: "src/lib.rs",
      edition: "2018",
 -    features: [
 -        "boringssl-vendored",
@@ -15,7 +22,9 @@ index a810b69..ec19374 100644
          "liblazy_static",
          "liblibc",
          "liblibm",
-@@ -65,7 +61,8 @@ rust_library {
+         "liblog_rust",
+         "liboctets",
+         "libring",
          "libslab",
          "libsmallvec",
      ],
@@ -25,7 +34,12 @@ index a810b69..ec19374 100644
          "libcrypto",
          "libssl",
      ],
-@@ -78,7 +75,7 @@ rust_library {
+     apex_available: [
+         "//apex_available:platform",
+         "com.android.resolv",
+     ],
+     product_available: true,
+     vendor_available: true,
      min_sdk_version: "29",
  }
  
@@ -34,9 +48,9 @@ index a810b69..ec19374 100644
      name: "libquiche_ffi",
      host_supported: true,
      crate_name: "quiche",
-@@ -86,11 +83,7 @@ rust_ffi_shared {
+     cargo_env_compat: true,
      cargo_pkg_version: "0.17.1",
-     srcs: ["src/lib.rs"],
+     crate_root: "src/lib.rs",
      edition: "2018",
 -    features: [
 -        "boringssl-vendored",
@@ -47,7 +61,9 @@ index a810b69..ec19374 100644
          "liblazy_static",
          "liblibc",
          "liblibm",
-@@ -100,7 +93,8 @@ rust_ffi_shared {
+         "liblog_rust",
+         "liboctets",
+         "libring",
          "libslab",
          "libsmallvec",
      ],
@@ -57,7 +73,21 @@ index a810b69..ec19374 100644
          "libcrypto",
          "libssl",
      ],
-@@ -141,7 +135,7 @@ rust_test_host {
+     apex_available: [
+         "//apex_available:platform",
+         "com.android.resolv",
+     ],
+     product_available: true,
+     vendor_available: true,
+     min_sdk_version: "29",
+@@ -136,21 +130,21 @@ rust_test_host {
+         "liblibc",
+         "liblibm",
+         "liblog_rust",
+         "libmio",
+         "liboctets",
+         "libring",
+         "libslab",
          "libsmallvec",
          "liburl",
      ],
@@ -66,9 +96,34 @@ index a810b69..ec19374 100644
          "libcrypto",
          "libssl",
      ],
-@@ -198,10 +192,6 @@ rust_library_rlib {
+     data: [
+         "examples/cert.crt",
+         "examples/cert.key",
+         "examples/cert-big.crt",
+         "examples/rootca.crt",
+     ],
+ }
+@@ -183,34 +177,31 @@ rust_test {
+     static_libs: [
+         "libcrypto_static",
+         "libssl",
+     ],
+     data: [
+         "examples/cert.crt",
+         "examples/cert.key",
+         "examples/cert-big.crt",
+         "examples/rootca.crt",
+     ],
++    shared_libs: ["libc++"],
+ }
+ 
+ rust_library_rlib {
+     name: "libquiche_static",
+     host_supported: true,
+     crate_name: "quiche",
+     cargo_env_compat: true,
      cargo_pkg_version: "0.17.1",
-     srcs: ["src/lib.rs"],
+     crate_root: "src/lib.rs",
      edition: "2018",
 -    features: [
 -        "boringssl-vendored",
@@ -77,3 +132,10 @@ index a810b69..ec19374 100644
      rustlibs: [
          "liblazy_static",
          "liblibc",
+         "liblibm",
+         "liblog_rust",
+         "liboctets",
+         "libring",
+         "libslab",
+         "libsmallvec",
+     ],
