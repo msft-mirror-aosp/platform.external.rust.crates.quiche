@@ -7,6 +7,7 @@
   "package": {
     "quiche": {
       "patch": "patches/Android.bp.patch",
+      "add_toplevel_block": "ffi_headers.bp.fragment",
       "test_data": {
         "src/lib.rs": [
           "examples/cert.crt",
