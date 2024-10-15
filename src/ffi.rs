@@ -102,10 +102,7 @@ use crate::*;
 
 #[no_mangle]
 pub extern fn quiche_version() -> *const u8 {
-    //static VERSION: &str = concat!("0.17.1", "\0");
-    // ANDROID's build system doesn't support environment variables
-    // so we hardcode the package version here.
-    static VERSION: &str = concat!("0.6.0", "\0");
+    static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr()
 }
 
