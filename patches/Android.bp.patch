@@ -2,6 +2,19 @@ diff --git a/Android.bp b/Android.bp
 index a1a223b..1b4784b 100644
 --- a/Android.bp
 +++ b/Android.bp
+@@ -9,7 +9,11 @@ package {
+ license {
+     name: "external_rust_crates_quiche_license",
+     visibility: [":__subpackages__"],
+-    license_kinds: ["SPDX-license-identifier-BSD-2-Clause"],
++    license_kinds: [
++        "SPDX-license-identifier-BSD-2-Clause",
++        "SPDX-license-identifier-ISC",
++        "SPDX-license-identifier-OpenSSL",
++    ],
+     license_text: ["LICENSE"],
+ }
+
 @@ -46,70 +46,64 @@ cc_library_headers {
  }
  
